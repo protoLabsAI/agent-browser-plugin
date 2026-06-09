@@ -38,6 +38,16 @@ def register(registry) -> None:
     except Exception:  # noqa: BLE001
         log.exception("[agent_browser] mounting browser panel failed")
 
+    # Lifecycle (ADR 0018): on shutdown, stop the dashboard daemon we manage so it
+    # doesn't outlive the server (dashboard-only; the session is left alone).
+    try:
+        from .lifecycle import make_dashboard_surface
+        start, stop = make_dashboard_surface(cfg)
+        registry.register_surface(start, stop=stop, name="agent-browser-dashboard")
+    except Exception:  # noqa: BLE001 — lifecycle is best-effort; tools/panel still serve
+        log.exception("[agent_browser] registering lifecycle surface failed")
+
     # skills/ and workflows/ are auto-discovered (ADR 0027) — no register call.
-    log.info("[agent_browser] registered browser tools (binary=%s, dashboard:%s)",
-             cfg.get("binary", "agent-browser"), cfg.get("dashboard_port", 4848))
+    log.info("[agent_browser] registered browser tools (binary=%s, dashboard:%s, manage=%s)",
+             cfg.get("binary", "agent-browser"), cfg.get("dashboard_port", 4848),
+             cfg.get("manage_dashboard", True))

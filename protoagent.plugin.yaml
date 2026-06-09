@@ -33,6 +33,8 @@ config:
   allowed_domains: ""       # comma-separated navigable-domain whitelist (e.g. "example.com,*.foo.com")
   confirm_actions: ""       # comma-separated action categories that require confirmation
   max_output: 0             # cap page-text output chars (LLM-safety); 0 = CLI default
+  manage_dashboard: true    # on server shutdown, stop the dashboard daemon (ADR 0018 teardown);
+                            # set false to keep a shared/persistent dashboard running
 
 # Console view (ADR 0026) — embeds agent-browser's live dashboard (viewport + feeds).
 views:
