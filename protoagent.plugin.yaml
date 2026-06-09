@@ -21,8 +21,18 @@ min_protoagent_version: "0.27.0"
 config_section: agent_browser
 config:
   binary: agent-browser     # the agent-browser CLI on PATH (override for a pinned path)
-  dashboard_port: 4848      # agent-browser dashboard start --port; the panel iframes this
+  dashboard_port: 4848      # agent-browser dashboard start --port; full-mode panel iframes this
   timeout_s: 60             # per-command subprocess timeout
+  panel_mode: full          # Browser panel layout: `full` (iframe the dashboard — viewport +
+                            # feeds) or `minimal` (viewport-only: live screenshot + a nav toolbar)
+  # Runtime / launch options — a curated set passed to `agent-browser open` so you can
+  # shape and lock down the browser the agent spins up. Blank/0/false = CLI default.
+  headed: false             # show a real browser window instead of headless
+  profile: ""               # path to a browser profile dir (isolation + persisted auth/cookies)
+  device: ""                # device emulation, e.g. "iPhone 16 Pro"
+  allowed_domains: ""       # comma-separated navigable-domain whitelist (e.g. "example.com,*.foo.com")
+  confirm_actions: ""       # comma-separated action categories that require confirmation
+  max_output: 0             # cap page-text output chars (LLM-safety); 0 = CLI default
 
 # Console view (ADR 0026) — embeds agent-browser's live dashboard (viewport + feeds).
 views:
