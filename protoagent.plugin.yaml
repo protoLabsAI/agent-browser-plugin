@@ -1,0 +1,34 @@
+id: agent_browser
+name: Agent Browser
+version: 0.1.0
+description: >-
+  Browser automation for protoAgent, backed by **agent-browser** (vercel-labs) — a
+  fast native-Rust CLI/daemon that drives Chrome over CDP with accessibility-tree
+  snapshots and compact `@eN` element refs. Wraps the CLI as tools (open, snapshot,
+  click, fill, type, screenshot, …), ships a discovery skill that defers to the
+  CLI's always-current workflow content, browser workflows, and a **Browser panel**
+  console view that embeds agent-browser's own live dashboard (the viewport +
+  activity/console/network feeds).
+
+  Requires the **`agent-browser`** binary on PATH (`npm i -g agent-browser &&
+  agent-browser install`). Ships DISABLED; enable with
+  `plugins: { enabled: [agent_browser] }`.
+enabled: false
+repository: https://github.com/protoLabsAI/agent-browser-plugin
+min_protoagent_version: "0.27.0"
+
+# Plugin config (read from `agent_browser:` in langgraph-config.yaml).
+config_section: agent_browser
+config:
+  binary: agent-browser     # the agent-browser CLI on PATH (override for a pinned path)
+  dashboard_port: 4848      # agent-browser dashboard start --port; the panel iframes this
+  timeout_s: 60             # per-command subprocess timeout
+
+# Console view (ADR 0026) — embeds agent-browser's live dashboard (viewport + feeds).
+views:
+  - { id: panel, label: "Browser", icon: Globe, path: /plugins/agent_browser/panel }
+
+# Declarative only (surfaced for review).
+capabilities:
+  network: ["*"]            # the browser navigates arbitrary URLs
+  filesystem: scoped        # screenshots / pdfs / state files the user requests

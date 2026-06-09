@@ -1,0 +1,24 @@
+[project]
+name = "agent-browser-plugin"
+version = "0.1.0"
+description = "Browser-automation plugin for protoAgent, backed by vercel-labs/agent-browser (tools + skill + workflows + a live browser panel)."
+requires-python = ">=3.11"
+
+# Runtime deps come from the protoAgent host (langchain-core, fastapi). The only
+# external dependency is the `agent-browser` CLI on PATH — so requires_pip is empty.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E402", "E501", "E702", "E731", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401"]
