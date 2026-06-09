@@ -32,9 +32,15 @@ same four-step loop:
 
 When finished, call `browser_close` to free the browser session.
 
-For the always-current, full workflow reference (including advanced patterns
-like file uploads, multi-tab work, and form automation), run:
+For the always-current usage — workflows, common patterns, troubleshooting, and
+(with `--full`) the complete command reference and templates — load it from the
+CLI, which serves skill content matched to the installed version so the
+instructions never go stale:
 
 ```
-agent-browser help workflow
+agent-browser skills get core          # start here — workflows, patterns, troubleshooting
+agent-browser skills get core --full   # + full command reference and templates
 ```
+
+There are also specialized skills (e.g. Electron apps, Slack, cloud browsers) —
+list them with `agent-browser skills list`.
