@@ -92,7 +92,7 @@ def _full_page(port: int) -> str:
 # ~30px wrapper bar is ours; the viewport is agent-browser's third-party dashboard.
 _FULL_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Browser</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@protolabsai/ui@0.22/dist/plugin-kit.css">
+<link rel="stylesheet" href="/_ds/plugin-kit.css">
 <style>
   html,body{margin:0;height:100%;background:var(--pl-color-bg);font-family:var(--pl-font-sans)}
   .bar{height:30px;display:flex;align-items:center;gap:8px;padding:0 12px;color:var(--pl-color-fg-muted);
@@ -124,7 +124,7 @@ window.addEventListener("message",(e)=>{const d=e.data||{};
 # .pl-btn, url as .pl-input, empty state as .pl-empty), themed live by the handshake.
 _MINIMAL_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Browser</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@protolabsai/ui@0.22/dist/plugin-kit.css">
+<link rel="stylesheet" href="/_ds/plugin-kit.css">
 <style>
   html,body{margin:0;height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);
     font-family:var(--pl-font-sans);font-size:13px}
