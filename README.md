@@ -40,7 +40,12 @@ point.
 - **Browser panel** — a console view (ADR 0026) that **embeds agent-browser's own
   live dashboard** (`agent-browser dashboard start`, port 4848): the live viewport
   (CDP screencast) + the command activity / console / network feeds. We hijack their
-  renderer rather than building one.
+  renderer rather than building one. The dashboard is served **same-origin through
+  the plugin's own reverse-proxy route** (`/plugins/agent_browser/panel/dash`,
+  HTTP + WebSocket), so the embed rides the fleet proxy (ADR 0042) on the host and
+  on a member alike — it never points the operator's browser at `localhost:PORT`
+  (issue #6). `minimal` mode (`panel_mode: minimal`) renders a viewport-only page
+  (live screenshot + nav toolbar) with no WS dependency.
 
 ## Requirements
 
