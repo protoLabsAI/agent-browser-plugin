@@ -59,49 +59,16 @@ def build_panel_router(cfg: dict | None):
 
     router = APIRouter()
 
-    def _run(*args: str) -> tuple[int, str]:
-        try:
-            p = subprocess.run([binary, *args], capture_output=True, text=True, timeout=timeout)
-            return p.returncode, (p.stderr or p.stdout or "").strip()
-        except FileNotFoundError:
-            return 127, f"{binary!r} not on PATH"
-        except subprocess.TimeoutExpired:
-            return 124, "timed out"
-
     @router.get("/panel")
     async def _panel():
         return HTMLResponse(_MINIMAL_PAGE if mode == "minimal" else _FULL_PAGE)
 
-    # ── minimal-mode backing routes (same-origin) ─────────────────────────────
-    @router.get("/panel/shot")
-    async def _shot():
-        """Latest viewport as a PNG. Throttled to ~1/0.8s so a fast poller can't
-        spawn a screenshot subprocess per frame."""
-        global _shot_ts
-        now = time.monotonic()
-        if now - _shot_ts > 0.8 or not os.path.exists(_SHOT_PATH):
-            rc, err = await asyncio.to_thread(lambda: _run("screenshot", _SHOT_PATH))
-            if rc == 0 and os.path.exists(_SHOT_PATH):
-                _shot_ts = now
-            else:
-                return Response(status_code=503, content=f"no frame: {err[:200]}")
-        return FileResponse(_SHOT_PATH, media_type="image/png",
-                            headers={"Cache-Control": "no-store"})
-
-    @router.post("/panel/nav")
-    async def _nav(body: dict = Body(...)):
-        """Drive the viewport from the toolbar: open <url> / back / forward / reload."""
-        action = str(body.get("action", "")).strip().lower()
-        url = str(body.get("url", "")).strip()
-        if action == "open":
-            if not url:
-                return JSONResponse({"ok": False, "error": "url required"})
-            rc, err = await asyncio.to_thread(lambda: _run("open", url))
-        elif action in ("back", "forward", "reload"):
-            rc, err = await asyncio.to_thread(lambda: _run(action))
-        else:
-            return JSONResponse({"ok": False, "error": f"bad action {action!r}"})
-        return JSONResponse({"ok": rc == 0, "error": "" if rc == 0 else err[:200]})
+    # The minimal-mode shot/nav DATA routes moved to build_panel_data_router —
+    # gated under /api/plugins/agent_browser (plugin-view rule 2). The /panel/dash
+    # reverse proxy below stays on the public prefix OF NECESSITY: it's loaded by
+    # an <iframe>, and an iframe navigation can't carry an Authorization bearer.
+    # Gating it needs a designed handoff (tracked upstream) — same posture as the
+    # page itself.
 
     # ── full-mode backing route: same-origin reverse proxy to the dashboard ────
     # The dashboard daemon binds the SERVING box's loopback (127.0.0.1:<port>).
@@ -215,6 +182,61 @@ def build_panel_router(cfg: dict | None):
     return router
 
 
+def build_panel_data_router(cfg: dict | None):
+    """The minimal-mode DATA/ACTION routes — mounted under
+    ``/api/plugins/agent_browser`` so they inherit the operator bearer gate
+    (plugin-view rule 2). Previously ``/panel/shot`` + ``POST /panel/nav`` lived
+    under the public ``/plugins/`` prefix: on a token-gated deployment anyone who
+    could reach the port could DRIVE the operator's browser session and read its
+    screen without the bearer."""
+    cfg = cfg or {}
+    binary = str(cfg.get("binary") or "agent-browser")
+    timeout = float(cfg.get("timeout_s", 60))
+
+    router = APIRouter()
+
+    def _run(*args: str) -> tuple[int, str]:
+        try:
+            p = subprocess.run([binary, *args], capture_output=True, text=True, timeout=timeout)
+            return p.returncode, (p.stderr or p.stdout or "").strip()
+        except FileNotFoundError:
+            return 127, f"{binary!r} not on PATH"
+        except subprocess.TimeoutExpired:
+            return 124, "timed out"
+
+    @router.get("/shot")
+    async def _shot():
+        """Latest viewport as a PNG. Throttled to ~1/0.8s so a fast poller can't
+        spawn a screenshot subprocess per frame."""
+        global _shot_ts
+        now = time.monotonic()
+        if now - _shot_ts > 0.8 or not os.path.exists(_SHOT_PATH):
+            rc, err = await asyncio.to_thread(lambda: _run("screenshot", _SHOT_PATH))
+            if rc == 0 and os.path.exists(_SHOT_PATH):
+                _shot_ts = now
+            else:
+                return Response(status_code=503, content=f"no frame: {err[:200]}")
+        return FileResponse(_SHOT_PATH, media_type="image/png",
+                            headers={"Cache-Control": "no-store"})
+
+    @router.post("/nav")
+    async def _nav(body: dict = Body(...)):
+        """Drive the viewport from the toolbar: open <url> / back / forward / reload."""
+        action = str(body.get("action", "")).strip().lower()
+        url = str(body.get("url", "")).strip()
+        if action == "open":
+            if not url:
+                return JSONResponse({"ok": False, "error": "url required"})
+            rc, err = await asyncio.to_thread(lambda: _run("open", url))
+        elif action in ("back", "forward", "reload"):
+            rc, err = await asyncio.to_thread(lambda: _run(action))
+        else:
+            return JSONResponse({"ok": False, "error": f"bad action {action!r}"})
+        return JSONResponse({"ok": rc == 0, "error": "" if rc == 0 else err[:200]})
+
+    return router
+
+
 # ── full mode: iframe agent-browser's dashboard (same-origin reverse proxy) ────
 # Chrome is the protoLabs design system: link the no-build plugin-kit (--pl-* tokens
 # + .pl-* components), drive theming from the console handshake (ADR 0038). Only the
@@ -248,20 +270,17 @@ const DASH=BASE+"/plugins/agent_browser/panel/dash/";                // reverse-
     · <a id="dashlink" href="#" target="_blank">open</a></span>
     <span style="margin-left:auto">run <code>agent-browser dashboard start</code> if blank</span></div>
   <iframe id="f"></iframe>
-<script>
+<script type="module">
 document.getElementById("dashlink").href=DASH;
 document.getElementById("f").src=DASH;
-// ADR 0038 handshake — map the console's curated theme onto --pl-* tokens, and
-// forward the message to agent-browser's inner dashboard (now same-origin).
-const TMAP={bg:["--pl-color-bg"],bgPanel:["--pl-color-bg-raised","--pl-color-bg-subtle"],
-  fg:["--pl-color-fg"],fgMuted:["--pl-color-fg-muted"],brand:["--pl-color-accent"],border:["--pl-color-border"]};
-let TOKEN=null;
-function applyTheme(t){const r=document.documentElement;for(const[k,v] of Object.entries(t||{}))
-  (TMAP[k]||(k.startsWith("--pl-")?[k]:[])).forEach(p=>v&&r.style.setProperty(p,v));}
+// The DS plugin-kit owns theming THIS page's chrome (the handshake + live
+// re-themes onto --pl-*); it's an ES MODULE, so dynamic import (a classic
+// <script src> throws on its exports). The thin relay below stays: the embedded
+// third-party dashboard wants the RAW console message, which the kit doesn't
+// re-broadcast.
+try { (await import(BASE + "/_ds/plugin-kit.js")).initPluginView(); } catch (e) {}
 window.addEventListener("message",(e)=>{const d=e.data||{};
-  if(d.type==="protoagent:init"){ if(d.token)TOKEN=d.token; applyTheme(d.theme);
-    const f=document.getElementById("f"); try{f.contentWindow.postMessage(d,"*")}catch(_){} }
-  else if(d.type==="protoagent:theme"){ applyTheme(d.theme);
+  if(d.type==="protoagent:init"||d.type==="protoagent:theme"){
     const f=document.getElementById("f"); try{f.contentWindow.postMessage(d,"*")}catch(_){} }});
 </script></body></html>"""
 
@@ -302,38 +321,45 @@ document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
       <div class="pl-empty__desc">Open a URL above, or let the agent drive — <code>browser_open</code>.</div>
     </div>
   </div>
-<script>
-// ADR 0038 handshake — map the console's curated theme onto --pl-* tokens.
-const TMAP={bg:["--pl-color-bg"],bgPanel:["--pl-color-bg-raised","--pl-color-bg-subtle"],
-  fg:["--pl-color-fg"],fgMuted:["--pl-color-fg-muted"],brand:["--pl-color-accent"],border:["--pl-color-border"]};
-let TOKEN=null;
-function applyTheme(t){const r=document.documentElement;for(const[k,v] of Object.entries(t||{}))
-  (TMAP[k]||(k.startsWith("--pl-")?[k]:[])).forEach(p=>v&&r.style.setProperty(p,v));}
-window.addEventListener("message",(e)=>{const d=e.data||{};
-  if(d.type==="protoagent:init"){if(d.token)TOKEN=d.token;applyTheme(d.theme);}
-  else if(d.type==="protoagent:theme")applyTheme(d.theme);});
-const H=()=>TOKEN?{Authorization:"Bearer "+TOKEN}:{};
+<script type="module">
+// The DS plugin-kit owns the protoagent:init handshake (bearer + theme, incl. live
+// re-themes onto the --pl-* tokens) and slug-aware authed fetches — replacing the
+// hand-rolled TMAP/listener this page carried. plugin-kit.js is an ES MODULE, so it
+// loads via dynamic import (a classic <script src> throws on its exports; see
+// protoAgent docs/how-to/build-a-plugin-view.md). Older host without /_ds: fall
+// back to a tokenless same-origin shim.
+let kit;
+try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
+catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
 const $=(id)=>document.getElementById(id);
 $("url").addEventListener("keydown",(e)=>{if(e.key==="Enter")go()});
 
 async function nav(action,url){
-  try{ await fetch(BASE+"/plugins/agent_browser/panel/nav",{method:"POST",
-    headers:{"Content-Type":"application/json",...H()},body:JSON.stringify({action,url})});
+  try{ await kit.apiFetch("/api/plugins/agent_browser/nav",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({action,url})});
   }catch(_){}
   setTimeout(refresh,400);
 }
 function go(){ let u=$("url").value.trim(); if(!u)return; if(!/^https?:\/\//.test(u))u="https://"+u; nav("open",u); }
+// Module scripts are scoped — expose the toolbar's inline onclick handlers.
+window.nav=nav; window.go=go;
 
 let busy=false;
 async function refresh(){
   if(busy)return; busy=true;
   try{
-    const r=await fetch(BASE+"/plugins/agent_browser/panel/shot?t="+Date.now(),{headers:H()});
+    const r=await kit.apiFetch("/api/plugins/agent_browser/shot?t="+Date.now());
     if(r.ok){ const b=await r.blob(); const u=URL.createObjectURL(b);
       const img=$("screen"); const old=img.src; img.src=u; $("hint").style.display="none";
       if(old&&old.startsWith("blob:"))URL.revokeObjectURL(old); }
   }catch(_){}
   busy=false;
 }
-refresh(); setInterval(refresh,1200);   // ~live; the agent or the toolbar moves the page under us
+// Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
+// protoagent:init, so the gated shot/nav calls authenticate) or a short timer
+// for the no-handshake case (standalone page / older host).
+let booted=false;
+function boot(){ if(booted)return; booted=true; refresh(); setInterval(refresh,1200); }
+kit.initPluginView(boot);
+setTimeout(boot, 800);
 </script></body></html>"""
