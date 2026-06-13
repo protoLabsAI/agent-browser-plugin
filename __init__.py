@@ -30,9 +30,14 @@ def register(registry) -> None:
 
     # Browser panel console view (embeds agent-browser's dashboard). Built out by the
     # board; register it best-effort so the foundation works before the view lands.
+    # TWO routers at DISTINCT prefixes: the PAGE (+ the iframe-loaded /panel/dash
+    # proxy, which can't carry a bearer) stays on the public /plugins/agent_browser;
+    # the shot/nav DATA routes mount under /api/plugins/agent_browser so they
+    # inherit the operator bearer gate (plugin-view rule 2).
     try:
-        from .browser_panel import build_panel_router
+        from .browser_panel import build_panel_data_router, build_panel_router
         registry.register_router(build_panel_router(cfg))
+        registry.register_router(build_panel_data_router(cfg), prefix="/api/plugins/agent_browser")
     except ImportError:
         log.info("[agent_browser] browser panel not present yet — tools still serve")
     except Exception:  # noqa: BLE001
