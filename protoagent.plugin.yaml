@@ -1,6 +1,6 @@
 id: agent_browser
 name: Agent Browser
-version: 0.2.0
+version: 0.3.0
 description: >-
   Browser automation for protoAgent, backed by **agent-browser** (vercel-labs) — a
   fast native-Rust CLI/daemon that drives Chrome over CDP with accessibility-tree
@@ -35,6 +35,20 @@ config:
   max_output: 0             # cap page-text output chars (LLM-safety); 0 = CLI default
   manage_dashboard: true    # own the dashboard lifecycle (ADR 0018): start it on boot, stop it on
                             # shutdown. Set false to leave a shared/persistent dashboard untouched.
+
+# Editable in Settings ▸ Plugins (ADR 0019) — the operator knobs above as UI fields.
+settings:
+  - { key: panel_mode, label: "Browser panel mode", type: select, options: [full, minimal], description: "full = iframe agent-browser's live dashboard (viewport + activity/console/network feeds); minimal = viewport-only (a polled screenshot + a nav toolbar)." }
+  - { key: headed, label: "Headed browser", type: bool, description: "Show a real browser window instead of running headless." }
+  - { key: allowed_domains, label: "Allowed domains", type: string, description: "Comma-separated navigable-domain allowlist (e.g. example.com,*.foo.com). Blank = unrestricted." }
+  - { key: confirm_actions, label: "Confirm actions", type: string, description: "Comma-separated action categories that require confirmation before the agent runs them." }
+  - { key: profile, label: "Browser profile dir", type: string, description: "Path to a browser profile directory — isolation + persisted auth/cookies across sessions." }
+  - { key: device, label: "Device emulation", type: string, description: "Emulate a device, e.g. \"iPhone 16 Pro\". Blank = desktop." }
+  - { key: max_output, label: "Max page-text output (chars)", type: number, description: "Cap characters of page text returned to the model (LLM-safety). 0 = the CLI default." }
+  - { key: dashboard_port, label: "Dashboard port", type: number, description: "Port for agent-browser's dashboard daemon; the full-mode panel reverse-proxies it." }
+  - { key: timeout_s, label: "Command timeout (s)", type: number, description: "Per-command subprocess timeout for the browser tools." }
+  - { key: manage_dashboard, label: "Manage dashboard lifecycle", type: bool, description: "Start the dashboard on boot and stop it on shutdown. Turn off to leave a shared/persistent dashboard untouched." }
+  - { key: binary, label: "agent-browser binary", type: string, description: "The agent-browser CLI on PATH (override with a pinned absolute path if needed)." }
 
 # Console view (ADR 0026) — embeds agent-browser's live dashboard (viewport + feeds).
 views:

@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 *.png
 *.pdf
+.ruff_cache/
+.worktrees/
+.pytest_cache/
+.DS_Store
