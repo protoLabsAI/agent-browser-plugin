@@ -77,10 +77,25 @@ agent_browser:
 | File | What |
 |---|---|
 | `tools.py` | the browser tools — subprocess wrappers over the `agent-browser` CLI |
-| `browser_panel.py` | the console view that embeds the agent-browser dashboard |
+| `browser_panel.py` | the console view that embeds the agent-browser dashboard (same-origin reverse proxy) |
+| `lifecycle.py` | the dashboard daemon surface — start on boot, stop on shutdown (ADR 0018) |
 | `skills/` | the discovery skill (defers to `agent-browser skills get core`) |
 | `workflows/` | declarative browser recipes |
-| `__init__.py` | `register()` — wires tools + panel; skills/workflows auto-discovered |
+| `tests/` | the host-free pytest suite (subprocess mocked — no binary needed) |
+| `__init__.py` | `register()` — wires tools + panel + lifecycle; skills/workflows auto-discovered |
+
+The operator knobs (panel mode, headed, allowed domains, profile, device, …) are editable in
+**Settings ▸ Plugins ▸ Agent Browser**, or under `agent_browser:` in `langgraph-config.yaml`.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q          # host-free — subprocess is mocked, no agent-browser binary needed
+ruff check .
+```
+
+CI runs the same on every PR.
 
 Ships **disabled**; nothing runs until you enable it and the `agent-browser` binary
 is installed.

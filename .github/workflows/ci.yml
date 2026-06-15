@@ -1,0 +1,30 @@
+name: CI
+
+# Lint + host-free tests. Runs on the org's Namespace Linux profile (overridable via the
+# NSC_RUNNER repo var; falls back to a hosted runner on a fork). The suite mocks the
+# agent-browser CLI, so no browser/binary is needed.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ vars.NSC_RUNNER || 'namespace-profile-protolabs-linux' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev deps
+        run: pip install -r requirements-dev.txt ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q

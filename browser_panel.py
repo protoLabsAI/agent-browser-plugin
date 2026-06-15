@@ -54,8 +54,9 @@ def build_panel_router(cfg: dict | None):
     cfg = cfg or {}
     port = int(cfg.get("dashboard_port", 4848))
     mode = str(cfg.get("panel_mode", "full")).strip().lower()
-    binary = str(cfg.get("binary") or "agent-browser")
-    timeout = float(cfg.get("timeout_s", 60))
+    # NB: the page + dash-proxy routes don't shell out (binary/timeout) — they only
+    # reverse-proxy the dashboard daemon on `port`. The shot/nav DATA routes that DO
+    # run the CLI live in build_panel_data_router (gated under /api).
 
     router = APIRouter()
 
