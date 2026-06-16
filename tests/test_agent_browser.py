@@ -191,6 +191,7 @@ def test_panel_page_full_mode_embeds_local_or_errors():
     assert "LOOPBACK" in html  # local detection (loopback host + not fleet-proxied)
     assert "Open the console locally" in html  # the clear error shown when NOT local
     assert "/api/plugins/agent_browser/dashboard" in html  # the start/stop control
+    assert 'id="openlink"' in html and "Open ↗" in html  # open the dashboard in a new tab
     assert "panel_mode: minimal" in html  # the remote alternative the error points at
     # the dead sub-path proxy is gone; the port placeholder is interpolated.
     assert "/panel/dash" not in html

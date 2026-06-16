@@ -173,7 +173,10 @@ const DASH_URL="http://"+location.hostname+":"+PORT+"/";
   .card .d{color:var(--pl-color-fg-muted);line-height:1.6}
   .card code{background:var(--pl-color-bg-subtle,rgba(127,127,127,.16));padding:.1em .35em;border-radius:4px}
 </style></head><body>
-  <div class="bar"><b>Browser</b><span id="dash" title="agent-browser dashboard"></span></div>
+  <div class="bar"><b>Browser</b><span id="dash" title="agent-browser dashboard"></span>
+    <span style="flex:1"></span>
+    <a id="openlink" class="pl-btn pl-btn--ghost pl-btn--sm" target="_blank" rel="noopener"
+       title="Open the dashboard in a new tab" style="display:none">Open ↗</a></div>
   <div class="stage">
     <iframe id="f" referrerpolicy="no-referrer" allow="clipboard-read; clipboard-write"></iframe>
     <div id="msg"><div class="card"><div class="t" id="mt"></div><div class="d" id="md"></div></div></div>
@@ -183,6 +186,11 @@ const $=(id)=>document.getElementById(id);
 let kit;
 try { kit = await import(BASE + "/_ds/plugin-kit.js"); kit.initPluginView(); }
 catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
+
+// Open-in-new-tab — show it whenever the dashboard is on THIS machine (loopback host, not
+// fleet-proxied), so you can pop the embedded dashboard out into a full tab. A top-level
+// new-tab nav reaches the http dashboard even from an https console (unlike the embed).
+if(LOCAL){ const o=$("openlink"); o.href=DASH_URL; o.style.display=""; }
 
 function showFrame(){ $("f").src=DASH_URL; $("f").style.display="block"; $("msg").style.display="none"; }
 function showMsg(title, html){ $("mt").textContent=title; $("md").innerHTML=html;
@@ -213,8 +221,9 @@ async function decide(){
   if(MIXED){
     renderDash(null);
     showMsg("Can't embed the dashboard over https",
-      "The console is served over https, but agent-browser's dashboard is http — browsers block that mix. "
-      + "Open the console at <code>http://localhost</code>, or set <code>panel_mode: minimal</code>.");
+      "The console is served over https, but agent-browser's dashboard is http — browsers block that mix "
+      + "for an embedded frame. Use <b>Open ↗</b> above to view it in a new tab, set "
+      + "<code>panel_mode: minimal</code>, or open the console at <code>http://localhost</code>.");
     return;
   }
   const running = await dashRunning(); renderDash(running);
