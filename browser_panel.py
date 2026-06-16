@@ -138,71 +138,101 @@ def build_panel_data_router(cfg: dict | None):
     return router
 
 
-# ── full mode: a LAUNCHER for agent-browser's dashboard (not an embed) ──────────
-# The dashboard is a prebuilt Next.js app whose assets are root-absolute (/_next/…)
-# with no base-path option, so it can't render under our sub-path panel — it only
-# loads at its OWN origin. So full mode is a launcher: a Start/Stop control + an
-# "Open dashboard ↗" link to that origin (reachable on a local/host setup). For a
-# remote member, minimal mode is the one that works.
+# ── full mode (default): embed agent-browser's dashboard at its OWN origin ──────
+# The dashboard is a Next.js app with root-absolute assets (no base-path), so it only
+# renders at its own origin (http://<host>:<port>/) — never under a sub-path proxy. Full
+# mode therefore ASSUMES A LOCAL setup (console + agent-browser on one machine) and iframes
+# that loopback origin directly. When the console is opened remotely (a fleet member, or a
+# non-loopback host, or over https) that loopback dashboard isn't reachable from the
+# operator's browser — we DETECT that and show a clear error instead of a blank frame.
 _FULL_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Browser</title>
 <link id="dskit" rel="stylesheet" href="">
 <script>
 const BASE=location.pathname.split("/plugins/")[0];
 document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
-const DASH_PORT=__DASH_PORT__;
-function dashOpenUrl(){ return "http://"+location.hostname+":"+DASH_PORT+"/"; }
+const PORT=__DASH_PORT__;
+const LOOPBACK=["localhost","127.0.0.1","[::1]","::1"].indexOf(location.hostname)>=0;
+const LOCAL=BASE==="" && LOOPBACK;            // host view (not fleet-proxied) + browser on the box
+const MIXED=location.protocol==="https:";     // dashboard is http; an https page can't embed it
+const DASH_URL="http://"+location.hostname+":"+PORT+"/";
 </script>
 <style>
   html,body{margin:0;height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);
     font-family:var(--pl-font-sans);font-size:13px}
-  .bar{height:38px;display:flex;align-items:center;gap:8px;padding:0 12px;
+  .bar{height:34px;display:flex;align-items:center;gap:8px;padding:0 12px;
     border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
   .bar b{color:var(--pl-color-accent)}
   .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
   .dot.ok{background:#22c55e}.dot.off{background:var(--pl-color-fg-muted,#9aa0aa)}
-  .stage{height:calc(100% - 38px);display:flex;align-items:center;justify-content:center;
-    padding:24px;background:var(--pl-color-bg-inset);box-sizing:border-box}
-  .card{max-width:440px;text-align:center}
+  .stage{height:calc(100% - 34px);position:relative;background:var(--pl-color-bg-inset)}
+  iframe{display:none;width:100%;height:100%;border:0;background:var(--pl-color-bg)}
+  #msg{display:none;position:absolute;inset:0;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}
+  .card{max-width:460px;text-align:center}
   .card .t{font-size:15px;font-weight:600;margin-bottom:8px}
-  .card .d{color:var(--pl-color-fg-muted);line-height:1.6;margin-bottom:16px}
-  .card .tip{margin-top:16px;font-size:11.5px;color:var(--pl-color-fg-muted)}
-  .card code{background:var(--pl-color-bg-subtle,rgba(127,127,127,.14));padding:.1em .35em;border-radius:4px}
+  .card .d{color:var(--pl-color-fg-muted);line-height:1.6}
+  .card code{background:var(--pl-color-bg-subtle,rgba(127,127,127,.16));padding:.1em .35em;border-radius:4px}
 </style></head><body>
   <div class="bar"><b>Browser</b><span id="dash" title="agent-browser dashboard"></span></div>
-  <div class="stage"><div class="card">
-    <div class="t">agent-browser dashboard</div>
-    <div class="d">The full dashboard — live viewport plus activity, console, and network
-      feeds — runs in its own window. It can't embed in this panel (its assets load from the
-      page root, which a sub-path panel can't serve), so it opens in a new tab.</div>
-    <a id="openlink" class="pl-btn pl-btn--primary" href="" target="_blank" rel="noopener">Open dashboard ↗</a>
-    <div class="tip">Want the browser <em>inside</em> the console? Set
-      <code>panel_mode: minimal</code> — a live viewport you can drive right here.</div>
-  </div></div>
+  <div class="stage">
+    <iframe id="f" referrerpolicy="no-referrer" allow="clipboard-read; clipboard-write"></iframe>
+    <div id="msg"><div class="card"><div class="t" id="mt"></div><div class="d" id="md"></div></div></div>
+  </div>
 <script type="module">
-document.getElementById("openlink").href=dashOpenUrl();
+const $=(id)=>document.getElementById(id);
 let kit;
 try { kit = await import(BASE + "/_ds/plugin-kit.js"); kit.initPluginView(); }
 catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
-// Dashboard control — start/stop the daemon from the panel (no terminal).
-function renderDash(running){
-  const el=document.getElementById("dash"); if(running===null){ el.innerHTML=""; return; }
-  el.innerHTML = running
+
+function showFrame(){ $("f").src=DASH_URL; $("f").style.display="block"; $("msg").style.display="none"; }
+function showMsg(title, html){ $("mt").textContent=title; $("md").innerHTML=html;
+  $("msg").style.display="flex"; $("f").style.display="none"; }
+
+function renderDash(state){
+  const el=$("dash");
+  if(!LOCAL || MIXED || state==null){ el.innerHTML=""; return; }   // control only matters when embeddable
+  el.innerHTML = state
     ? '<span class="dot ok"></span> running <button class="pl-btn pl-btn--ghost pl-btn--sm" onclick="dashAct(\'stop\')">Stop</button>'
     : '<span class="dot off"></span> stopped <button class="pl-btn pl-btn--sm" onclick="dashAct(\'start\')">Start dashboard</button>';
 }
-async function dashStatus(){
-  try{ const r=await kit.apiFetch("/api/plugins/agent_browser/dashboard"); const d=await r.json();
-    renderDash(!!d.running); }catch(_){ renderDash(null); }
+async function dashRunning(){
+  try{ const r=await kit.apiFetch("/api/plugins/agent_browser/dashboard"); return !!(await r.json()).running; }
+  catch(_){ return null; }
+}
+async function decide(){
+  if(!LOCAL){
+    renderDash(null);
+    showMsg("Open the console locally to see the dashboard",
+      "The dashboard embeds agent-browser's <b>local</b> dashboard — it only loads on the same machine that runs it. "
+      + (BASE ? "This panel is served through the fleet proxy" : "You're reaching the console at <code>"+location.hostname+"</code>")
+      + ", so its <code>localhost:"+PORT+"</code> dashboard isn't reachable from your browser.<br><br>"
+      + "Open the console at <code>http://localhost</code> on the host, or set <code>panel_mode: minimal</code> "
+      + "for a screenshot viewport that works remotely.");
+    return;
+  }
+  if(MIXED){
+    renderDash(null);
+    showMsg("Can't embed the dashboard over https",
+      "The console is served over https, but agent-browser's dashboard is http — browsers block that mix. "
+      + "Open the console at <code>http://localhost</code>, or set <code>panel_mode: minimal</code>.");
+    return;
+  }
+  const running = await dashRunning(); renderDash(running);
+  if(running){ showFrame(); }
+  else { showMsg("Dashboard not running",
+    "Click <b>Start dashboard</b> in the top bar to launch it and view it here "
+    + "(or run <code>agent-browser dashboard start</code>)."); }
 }
 async function dashAct(action){
-  document.getElementById("dash").innerHTML='<span class="dot off"></span> …';
+  $("dash").innerHTML='<span class="dot off"></span> …';
   try{ await kit.apiFetch("/api/plugins/agent_browser/dashboard",{method:"POST",
     headers:{"Content-Type":"application/json"},body:JSON.stringify({action})}); }catch(_){}
-  setTimeout(dashStatus, 900);
+  setTimeout(decide, action==="start"?1500:700);
 }
 window.dashAct=dashAct;
-dashStatus(); setInterval(dashStatus, 6000);
+decide();
+// While local + not yet embedded, re-check so a dashboard started elsewhere appears on its own.
+setInterval(()=>{ if(LOCAL && !MIXED && $("f").style.display==="none") decide(); }, 6000);
 </script></body></html>"""
 
 

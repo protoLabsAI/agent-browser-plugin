@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.0
+- **`full` is the default again, and it embeds the dashboard inline.** Full mode iframes
+  agent-browser's dashboard at its own **local origin** (`http://<host>:<port>/`) — so on a local
+  setup (console + agent-browser on one machine) you get the real dashboard, feeds and all, right
+  in the panel. (v0.4.0 turned it into a new-tab launcher; this brings the inline embed back, the
+  right way — at the dashboard's origin, not through the impossible sub-path proxy.)
+- **A clear error instead of a blank frame when it can't embed.** If the console is opened remotely
+  (a fleet member, a non-loopback host, or over https) the dashboard's `localhost` isn't reachable
+  from your browser — the panel detects that (loopback host + not fleet-proxied + not https) and
+  says so, pointing you at `panel_mode: minimal` (which still works everywhere). Start/Stop the
+  dashboard from the panel as before; a not-yet-running dashboard shows a Start prompt.
+
 ## v0.4.0
 - **The Browser panel works out of the box now.** The default `panel_mode` is **`minimal`** — a
   live screenshot + nav toolbar driven through the gated same-origin routes; it works everywhere

@@ -39,15 +39,16 @@ point.
 - **Workflows** — declarative browser recipes (browse-and-extract, fill-a-form, …).
 - **Browser panel** — a console view (ADR 0026) for watching/driving the browser. Two
   modes, set by `panel_mode`:
-  - **`minimal` (default)** — a **live screenshot** of the viewport + a nav toolbar + a
-    **Dashboard control** (start/stop/status), all through the **gated same-origin routes**.
-    Works everywhere (host and member), no dashboard daemon needed. The reliable mode.
-  - **`full`** — a **launcher** for agent-browser's own dashboard (viewport + activity/
-    console/network feeds). It's not embedded: that dashboard is a Next.js app with
-    **root-absolute asset paths** (no base-path), so it can't render under a sub-path
-    panel — it only loads at its **own origin**. Full mode opens it there
-    ("Open dashboard ↗"), which works on a local/host setup. For a remote member, use
-    `minimal`.
+  - **`full` (default)** — **embeds agent-browser's dashboard inline** (viewport + activity/
+    console/network feeds) at its own **local origin** (`http://<host>:<port>/`). Best for a
+    **local setup** (console + agent-browser on one machine). Because the dashboard is a
+    Next.js app with root-absolute assets (no base-path), it only loads at its own origin —
+    so when the console is opened **remotely** (a fleet member, a non-loopback host, or over
+    https) its `localhost` isn't reachable from your browser, and the panel shows a **clear
+    error** (pointing you at `minimal`) rather than a blank frame.
+  - **`minimal`** — a **live screenshot** of the viewport + a nav toolbar, all through the
+    **gated same-origin routes**. Works everywhere (host and member), no dashboard daemon
+    needed — use it for a remote/member agent.
 
   Either mode can **start the dashboard from the panel** (no terminal) — the Start/Stop
   control hits the gated `POST /api/plugins/agent_browser/dashboard`.
