@@ -177,7 +177,7 @@ def _app(cfg=None):
     return app
 
 
-def test_panel_page_full_mode_is_a_launcher():
+def test_panel_page_full_mode_embeds_local_or_errors():
     from fastapi.testclient import TestClient
 
     c = TestClient(_app({"panel_mode": "full", "dashboard_port": 4955}))
@@ -186,14 +186,15 @@ def test_panel_page_full_mode_is_a_launcher():
     html = r.text
     assert "/_ds/plugin-kit.css" in html  # DS kit
     assert 'location.pathname.split("/plugins/")[0]' in html  # slug-aware base
-    assert "Open dashboard" in html  # a launcher to the dashboard's own origin (not an embed)
+    assert 'id="f"' in html  # the dashboard iframe
+    assert '"http://"+location.hostname+":"+PORT' in html  # embed the dashboard's OWN local origin
+    assert "LOOPBACK" in html  # local detection (loopback host + not fleet-proxied)
+    assert "Open the console locally" in html  # the clear error shown when NOT local
     assert "/api/plugins/agent_browser/dashboard" in html  # the start/stop control
-    assert "panel_mode: minimal" in html  # points users at the mode that embeds inline
-    # full mode no longer embeds a sub-path proxy; the port placeholder is interpolated.
+    assert "panel_mode: minimal" in html  # the remote alternative the error points at
+    # the dead sub-path proxy is gone; the port placeholder is interpolated.
     assert "/panel/dash" not in html
     assert "__DASH_PORT__" not in html and "4955" in html
-    # the "open" link is built from location.hostname, never a hardcoded origin.
-    assert "http://localhost" not in html and "http://127.0.0.1" not in html
 
 
 def test_panel_page_minimal_mode_uses_gated_data_routes():
@@ -210,13 +211,13 @@ def test_panel_page_minimal_mode_uses_gated_data_routes():
     assert "__DASH_PORT__" not in html and "4933" in html
 
 
-def test_default_panel_mode_is_minimal():
+def test_default_panel_mode_is_full():
     import yaml
 
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
-    assert m["config"]["panel_mode"] == "minimal"  # the reliable mode is the default now
+    assert m["config"]["panel_mode"] == "full"  # embed the dashboard by default (local setup)
     by_key = {f["key"]: f for f in m["settings"]}
-    assert by_key["panel_mode"]["options"][0] == "minimal"  # recommended first
+    assert by_key["panel_mode"]["options"][0] == "full"  # default listed first
 
 
 def test_dashboard_control_endpoint(monkeypatch):
