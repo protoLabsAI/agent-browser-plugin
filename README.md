@@ -37,18 +37,17 @@ point.
 - **Skill** — a discovery skill that defers to the CLI's always-current workflow
   content (`agent-browser skills get core`), so instructions never go stale.
 - **Workflows** — declarative browser recipes (browse-and-extract, fill-a-form, …).
-- **Browser panel** — a console view (ADR 0026) that **embeds agent-browser's own
-  live dashboard** (`agent-browser dashboard start`, port 4848): the live viewport
-  (live screenshot + nav toolbar). Two modes, set by `panel_mode`:
-  - **`minimal` (default)** — a live screenshot of the viewport + a nav toolbar + a
-    **Dashboard control** (start/stop/status), all through the **gated same-origin
-    routes**. Works everywhere (host and member), no dashboard daemon needed. This is
-    the reliable mode.
-  - **`full`** — iframes agent-browser's own dashboard (viewport + activity/console/
-    network feeds). The dashboard is a Next.js app with **root-absolute asset paths**,
-    so it **can't be embedded through a sub-path reverse proxy** (it renders blank). Full
-    mode links out to the dashboard's own origin ("open directly ↗"), which works on a
-    local/host setup. For a remote member, use `minimal`.
+- **Browser panel** — a console view (ADR 0026) for watching/driving the browser. Two
+  modes, set by `panel_mode`:
+  - **`minimal` (default)** — a **live screenshot** of the viewport + a nav toolbar + a
+    **Dashboard control** (start/stop/status), all through the **gated same-origin routes**.
+    Works everywhere (host and member), no dashboard daemon needed. The reliable mode.
+  - **`full`** — a **launcher** for agent-browser's own dashboard (viewport + activity/
+    console/network feeds). It's not embedded: that dashboard is a Next.js app with
+    **root-absolute asset paths** (no base-path), so it can't render under a sub-path
+    panel — it only loads at its **own origin**. Full mode opens it there
+    ("Open dashboard ↗"), which works on a local/host setup. For a remote member, use
+    `minimal`.
 
   Either mode can **start the dashboard from the panel** (no terminal) — the Start/Stop
   control hits the gated `POST /api/plugins/agent_browser/dashboard`.
@@ -83,7 +82,7 @@ agent_browser:
 | File | What |
 |---|---|
 | `tools.py` | the browser tools — subprocess wrappers over the `agent-browser` CLI |
-| `browser_panel.py` | the console view that embeds the agent-browser dashboard (same-origin reverse proxy) |
+| `browser_panel.py` | the Browser panel — `minimal` (live viewport + nav + dashboard control) and `full` (a launcher for the dashboard) |
 | `lifecycle.py` | the dashboard daemon surface — start on boot, stop on shutdown (ADR 0018) |
 | `skills/` | the discovery skill (defers to `agent-browser skills get core`) |
 | `workflows/` | declarative browser recipes |

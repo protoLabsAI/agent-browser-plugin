@@ -177,21 +177,23 @@ def _app(cfg=None):
     return app
 
 
-def test_panel_page_full_mode_is_four_rules_compliant():
+def test_panel_page_full_mode_is_a_launcher():
     from fastapi.testclient import TestClient
 
-    c = TestClient(_app({"panel_mode": "full"}))
+    c = TestClient(_app({"panel_mode": "full", "dashboard_port": 4955}))
     r = c.get("/plugins/agent_browser/panel")
     assert r.status_code == 200
     html = r.text
     assert "/_ds/plugin-kit.css" in html  # DS kit
     assert 'location.pathname.split("/plugins/")[0]' in html  # slug-aware base
-    assert "/plugins/agent_browser/panel/dash/" in html  # same-origin proxied dashboard (embed)
-    # never a hardcoded http origin (issue #6) — the iframe src is BASE-derived same-origin;
-    # the "open directly" link is built from location.hostname, not a literal localhost.
-    assert "http://localhost" not in html and "http://127.0.0.1" not in html
-    assert "__DASH_PORT__" not in html  # the port placeholder is interpolated at serve time
+    assert "Open dashboard" in html  # a launcher to the dashboard's own origin (not an embed)
     assert "/api/plugins/agent_browser/dashboard" in html  # the start/stop control
+    assert "panel_mode: minimal" in html  # points users at the mode that embeds inline
+    # full mode no longer embeds a sub-path proxy; the port placeholder is interpolated.
+    assert "/panel/dash" not in html
+    assert "__DASH_PORT__" not in html and "4955" in html
+    # the "open" link is built from location.hostname, never a hardcoded origin.
+    assert "http://localhost" not in html and "http://127.0.0.1" not in html
 
 
 def test_panel_page_minimal_mode_uses_gated_data_routes():
@@ -253,9 +255,3 @@ def test_nav_route_validates(monkeypatch):
     assert c.post("/api/plugins/agent_browser/nav", json={"action": "reload"}).json()["ok"] is True
 
 
-def test_dash_proxy_502s_when_daemon_down():
-    from fastapi.testclient import TestClient
-
-    # nothing listens on the dashboard port in CI → the reverse proxy returns 502, not a crash.
-    r = TestClient(_app({"dashboard_port": 4999})).get("/plugins/agent_browser/panel/dash/")
-    assert r.status_code == 502

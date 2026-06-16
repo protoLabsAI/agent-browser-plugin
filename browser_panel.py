@@ -1,22 +1,21 @@
 """Browser panel console view (ADR 0026) — two modes, set by ``panel_mode``.
 
-- ``full`` (default): iframes agent-browser's own live dashboard (viewport +
-  activity/console/network/… feeds), reusing their renderer wholesale. The
-  dashboard is served **through this plugin's router** (a same-origin reverse
-  proxy under ``/plugins/agent_browser/panel/dash``) so the iframe rides the
-  fleet proxy (ADR 0042) on the host AND on a member — never a hardcoded
-  ``http://localhost:PORT`` (issue #6: that URL resolved against the operator's
-  own machine, not the member box → "refused to connect").
-- ``minimal``: a viewport-only page we render ourselves — a live screenshot (polled
-  from the CLI, same-origin, no WS-protocol dependency) plus a slim nav toolbar
-  (url / back / forward / reload). "Expose less": just the page, nothing else.
+- ``minimal`` (default): a viewport-only page we render ourselves — a live screenshot
+  (polled from the CLI through the gated /shot route, same-origin, no WS/proxy
+  dependency) + a nav toolbar (url / back / forward / reload) + a Dashboard control
+  (start/stop/status). Works everywhere — host and member alike.
+- ``full``: a launcher for agent-browser's own dashboard (viewport + activity/console/
+  network feeds). We deliberately do NOT embed it: that dashboard is a prebuilt Next.js
+  app whose assets are ROOT-ABSOLUTE (``/_next/…``) with no base-path option, so it can't
+  render under a sub-path reverse proxy (the long-standing blank panel) — it only renders
+  at its OWN origin. Full mode opens it there ("Open dashboard ↗"), which works on a
+  local/host setup; for a remote member, use minimal.
 
-Self-contained vanilla JS (no build step). Every fetch / iframe-src / asset is
-derived from ``base = location.pathname.split("/plugins/")[0]`` (="" on the host,
-``/agents/<slug>`` when proxied) so the page is same-origin + slug-aware — the rule
-that keeps the postMessage token/theme handshake working through the fleet proxy.
-The page reads/drives the browser only through the CLI behind same-origin routes;
-the agent's own browser_* tools are the primary driver — this is an operator viewport.
+Self-contained vanilla JS (no build step). Every fetch / link is derived from
+``base = location.pathname.split("/plugins/")[0]`` (="" on the host, ``/agents/<slug>``
+when proxied) so the page is same-origin + slug-aware (the token/theme handshake). The
+browser is driven only through the CLI behind same-origin routes; the agent's own
+browser_* tools are the primary driver — this is an operator viewport.
 """
 
 from __future__ import annotations
@@ -28,20 +27,10 @@ import subprocess
 import tempfile
 import time
 
-# Imported at MODULE scope (not inside the factory) so FastAPI can resolve the
-# string annotations these routes carry — with `from __future__ import annotations`
-# every annotation is a string and FastAPI's get_type_hints() looks them up in the
-# module globals, so `request: Request` / `websocket: WebSocket` must live here.
-# Safe: the host always provides fastapi, and __init__.py catches ImportError
-# (tools still serve if the panel can't import).
-from fastapi import APIRouter, Body, Request, WebSocket
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    JSONResponse,
-    Response,
-    StreamingResponse,
-)
+# Module-scope fastapi imports (the host always provides fastapi; __init__.py catches
+# ImportError so the tools still serve if the panel can't import).
+from fastapi import APIRouter, Body
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 log = logging.getLogger("protoagent.plugins.agent_browser")
 
@@ -53,10 +42,7 @@ def build_panel_router(cfg: dict | None):
 
     cfg = cfg or {}
     port = int(cfg.get("dashboard_port", 4848))
-    mode = str(cfg.get("panel_mode", "full")).strip().lower()
-    # NB: the page + dash-proxy routes don't shell out (binary/timeout) — they only
-    # reverse-proxy the dashboard daemon on `port`. The shot/nav DATA routes that DO
-    # run the CLI live in build_panel_data_router (gated under /api).
+    mode = str(cfg.get("panel_mode", "minimal")).strip().lower()
 
     router = APIRouter()
 
@@ -64,122 +50,6 @@ def build_panel_router(cfg: dict | None):
     async def _panel():
         page = _MINIMAL_PAGE if mode == "minimal" else _FULL_PAGE
         return HTMLResponse(page.replace("__DASH_PORT__", str(port)))
-
-    # The minimal-mode shot/nav DATA routes moved to build_panel_data_router —
-    # gated under /api/plugins/agent_browser (plugin-view rule 2). The /panel/dash
-    # reverse proxy below stays on the public prefix OF NECESSITY: it's loaded by
-    # an <iframe>, and an iframe navigation can't carry an Authorization bearer.
-    # Gating it needs a designed handoff (tracked upstream) — same posture as the
-    # page itself.
-
-    # ── full-mode backing route: same-origin reverse proxy to the dashboard ────
-    # The dashboard daemon binds the SERVING box's loopback (127.0.0.1:<port>).
-    # Proxying it through our own router makes the embed same-origin (so it rides
-    # the fleet proxy + the postMessage handshake works) instead of an absolute
-    # http://localhost:<port> the operator's browser would resolve against ITS
-    # OWN machine (issue #6 — unreachable for a member). Streaming-safe; upgrades
-    # WebSockets (the dashboard's live viewport/feed channels) when reachable.
-    _DASH = f"http://127.0.0.1:{port}"
-    # Hop-by-hop headers must not cross a proxy boundary (RFC 7230 §6.1).
-    _HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding",
-            "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate"}
-
-    @router.get("/panel/dash")
-    @router.get("/panel/dash/{path:path}")
-    async def _dash(request: Request, path: str = ""):
-        """HTTP reverse proxy → the local dashboard daemon (same-origin embed).
-        Streams the upstream response unbuffered (SSE-safe); 502 when the daemon
-        isn't up (e.g. ``agent-browser dashboard start`` hasn't run yet)."""
-        try:
-            import httpx
-        except Exception:  # noqa: BLE001 — httpx is a host dep; degrade if somehow absent
-            return Response(status_code=502, content="dashboard proxy unavailable (httpx missing)")
-        url = f"{_DASH}/{path}" if path else _DASH
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}
-        body = await request.body()
-        client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=5.0))
-        try:
-            upstream_req = client.build_request(
-                request.method, url, headers=headers, content=body,
-                params=dict(request.query_params))
-            upstream = await client.send(upstream_req, stream=True)
-        except (httpx.ConnectError, httpx.ConnectTimeout):
-            await client.aclose()
-            return Response(status_code=502,
-                            content="dashboard not reachable — run `agent-browser dashboard start`")
-        except Exception:  # noqa: BLE001
-            await client.aclose()
-            log.warning("[agent_browser] dashboard proxy error", exc_info=True)
-            return Response(status_code=502, content="dashboard proxy error")
-
-        async def _pipe():
-            try:
-                async for chunk in upstream.aiter_raw():
-                    yield chunk
-            finally:
-                await upstream.aclose()
-                await client.aclose()
-
-        resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _HOP}
-        return StreamingResponse(_pipe(), status_code=upstream.status_code, headers=resp_headers)
-
-    @router.websocket("/panel/dash")
-    @router.websocket("/panel/dash/{path:path}")
-    async def _dash_ws(websocket: WebSocket, path: str = ""):
-        """WebSocket reverse proxy → the dashboard's live channels (CDP screencast /
-        activity feeds). Bidirectional pump; both halves close together. Works on the
-        host directly; over the fleet proxy it depends on the hub forwarding upgrades."""
-        try:
-            import websockets
-            from websockets.exceptions import ConnectionClosed
-        except Exception:  # noqa: BLE001 — websockets is a host dep
-            await websocket.close(code=1011)
-            return
-        scheme = "ws"
-        target = f"{scheme}://127.0.0.1:{port}/{path}" if path else f"{scheme}://127.0.0.1:{port}"
-        qs = websocket.url.query
-        if qs:
-            target = f"{target}?{qs}"
-        subprotocols = websocket.scope.get("subprotocols") or None
-        await websocket.accept()
-        try:
-            async with websockets.connect(target, subprotocols=subprotocols,
-                                           open_timeout=5, max_size=None) as upstream:
-                async def _c2s():
-                    try:
-                        while True:
-                            msg = await websocket.receive()
-                            if msg.get("type") == "websocket.disconnect":
-                                break
-                            if (t := msg.get("text")) is not None:
-                                await upstream.send(t)
-                            elif (b := msg.get("bytes")) is not None:
-                                await upstream.send(b)
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                async def _s2c():
-                    try:
-                        async for data in upstream:
-                            if isinstance(data, (bytes, bytearray)):
-                                await websocket.send_bytes(bytes(data))
-                            else:
-                                await websocket.send_text(data)
-                    except (ConnectionClosed, Exception):  # noqa: BLE001
-                        pass
-
-                done, pending = await asyncio.wait(
-                    {asyncio.create_task(_c2s()), asyncio.create_task(_s2c())},
-                    return_when=asyncio.FIRST_COMPLETED)
-                for task in pending:
-                    task.cancel()
-        except Exception:  # noqa: BLE001 — daemon down / handshake failed
-            log.info("[agent_browser] dashboard ws proxy: upstream not reachable", exc_info=True)
-        finally:
-            try:
-                await websocket.close()
-            except Exception:  # noqa: BLE001
-                pass
 
     return router
 
@@ -268,61 +138,53 @@ def build_panel_data_router(cfg: dict | None):
     return router
 
 
-# ── full mode: iframe agent-browser's dashboard (same-origin reverse proxy) ────
-# Chrome is the protoLabs design system: link the no-build plugin-kit (--pl-* tokens
-# + .pl-* components), drive theming from the console handshake (ADR 0038). Only the
-# ~30px wrapper bar is ours; the viewport is agent-browser's third-party dashboard.
-#
-# The iframe src is derived SAME-ORIGIN + SLUG-AWARE (issue #6): the dashboard is
-# served through our own /panel/dash reverse proxy, never a hardcoded
-# http://localhost:PORT (which the operator's browser resolves against its OWN box —
-# unreachable for a member, and cross-origin breaks the postMessage handshake).
-#   base = location.pathname.split("/plugins/")[0]   (="" on host, /agents/<slug> proxied)
-#   src  = base + "/plugins/agent_browser/panel/dash/"
+# ── full mode: a LAUNCHER for agent-browser's dashboard (not an embed) ──────────
+# The dashboard is a prebuilt Next.js app whose assets are root-absolute (/_next/…)
+# with no base-path option, so it can't render under our sub-path panel — it only
+# loads at its OWN origin. So full mode is a launcher: a Start/Stop control + an
+# "Open dashboard ↗" link to that origin (reachable on a local/host setup). For a
+# remote member, minimal mode is the one that works.
 _FULL_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Browser</title>
 <link id="dskit" rel="stylesheet" href="">
-<style>
-  html,body{margin:0;height:100%;background:var(--pl-color-bg);font-family:var(--pl-font-sans)}
-  .bar{height:30px;display:flex;align-items:center;gap:8px;padding:0 12px;color:var(--pl-color-fg-muted);
-    font-size:11.5px;border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
-  .bar b{color:var(--pl-color-accent)} a{color:var(--pl-color-accent)}
-  .bar .grow{flex:1}
-  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
-  .dot.ok{background:#22c55e}.dot.off{background:var(--pl-color-fg-muted,#9aa0aa)}
-  iframe{display:block;width:100%;height:calc(100% - 30px);border:0;background:var(--pl-color-bg)}
-</style></head><body>
 <script>
-// Same-origin base: "" on the host, "/agents/<slug>" when served through the fleet proxy.
 const BASE=location.pathname.split("/plugins/")[0];
-document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";   // DS kit, same-origin
-const DASH=BASE+"/plugins/agent_browser/panel/dash/";                // reverse-proxied dashboard
+document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
 const DASH_PORT=__DASH_PORT__;
 function dashOpenUrl(){ return "http://"+location.hostname+":"+DASH_PORT+"/"; }
 </script>
-  <div class="bar"><b>Browser</b>
-    <span id="dash" title="agent-browser dashboard"></span>
-    <span class="grow"></span>
-    <span>blank? the embedded dashboard can't load through a sub-path proxy —
-      <a href="" id="openlink" target="_blank" rel="noopener">open it directly ↗</a> or set panel_mode: minimal</span></div>
-  <iframe id="f"></iframe>
+<style>
+  html,body{margin:0;height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);
+    font-family:var(--pl-font-sans);font-size:13px}
+  .bar{height:38px;display:flex;align-items:center;gap:8px;padding:0 12px;
+    border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
+  .bar b{color:var(--pl-color-accent)}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+  .dot.ok{background:#22c55e}.dot.off{background:var(--pl-color-fg-muted,#9aa0aa)}
+  .stage{height:calc(100% - 38px);display:flex;align-items:center;justify-content:center;
+    padding:24px;background:var(--pl-color-bg-inset);box-sizing:border-box}
+  .card{max-width:440px;text-align:center}
+  .card .t{font-size:15px;font-weight:600;margin-bottom:8px}
+  .card .d{color:var(--pl-color-fg-muted);line-height:1.6;margin-bottom:16px}
+  .card .tip{margin-top:16px;font-size:11.5px;color:var(--pl-color-fg-muted)}
+  .card code{background:var(--pl-color-bg-subtle,rgba(127,127,127,.14));padding:.1em .35em;border-radius:4px}
+</style></head><body>
+  <div class="bar"><b>Browser</b><span id="dash" title="agent-browser dashboard"></span></div>
+  <div class="stage"><div class="card">
+    <div class="t">agent-browser dashboard</div>
+    <div class="d">The full dashboard — live viewport plus activity, console, and network
+      feeds — runs in its own window. It can't embed in this panel (its assets load from the
+      page root, which a sub-path panel can't serve), so it opens in a new tab.</div>
+    <a id="openlink" class="pl-btn pl-btn--primary" href="" target="_blank" rel="noopener">Open dashboard ↗</a>
+    <div class="tip">Want the browser <em>inside</em> the console? Set
+      <code>panel_mode: minimal</code> — a live viewport you can drive right here.</div>
+  </div></div>
 <script type="module">
 document.getElementById("openlink").href=dashOpenUrl();
-document.getElementById("f").src=DASH;
-// The DS plugin-kit owns theming THIS page's chrome (the handshake + live
-// re-themes onto --pl-*); it's an ES MODULE, so dynamic import (a classic
-// <script src> throws on its exports). The thin relay below stays: the embedded
-// third-party dashboard wants the RAW console message, which the kit doesn't
-// re-broadcast.
 let kit;
 try { kit = await import(BASE + "/_ds/plugin-kit.js"); kit.initPluginView(); }
-catch (e) { kit = { apiFetch: (p, i) => fetch(BASE + p, i) }; }
-window.addEventListener("message",(e)=>{const d=e.data||{};
-  if(d.type==="protoagent:init"||d.type==="protoagent:theme"){
-    const f=document.getElementById("f"); try{f.contentWindow.postMessage(d,"*")}catch(_){} }});
-
-// Dashboard control — status + start/stop from the panel (no terminal). Reload the iframe
-// after a start so a freshly-started dashboard appears without a manual refresh.
+catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
+// Dashboard control — start/stop the daemon from the panel (no terminal).
 function renderDash(running){
   const el=document.getElementById("dash"); if(running===null){ el.innerHTML=""; return; }
   el.innerHTML = running
@@ -337,7 +199,6 @@ async function dashAct(action){
   document.getElementById("dash").innerHTML='<span class="dot off"></span> …';
   try{ await kit.apiFetch("/api/plugins/agent_browser/dashboard",{method:"POST",
     headers:{"Content-Type":"application/json"},body:JSON.stringify({action})}); }catch(_){}
-  if(action==="start") setTimeout(()=>{ document.getElementById("f").src=DASH; }, 1200);
   setTimeout(dashStatus, 900);
 }
 window.dashAct=dashAct;
