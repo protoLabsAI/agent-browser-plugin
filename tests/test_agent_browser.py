@@ -186,18 +186,51 @@ def test_panel_page_full_mode_is_four_rules_compliant():
     html = r.text
     assert "/_ds/plugin-kit.css" in html  # DS kit
     assert 'location.pathname.split("/plugins/")[0]' in html  # slug-aware base
-    assert "/plugins/agent_browser/panel/dash/" in html  # same-origin proxied dashboard
-    # never a hardcoded http origin (issue #6) — the iframe src is BASE-derived same-origin.
+    assert "/plugins/agent_browser/panel/dash/" in html  # same-origin proxied dashboard (embed)
+    # never a hardcoded http origin (issue #6) — the iframe src is BASE-derived same-origin;
+    # the "open directly" link is built from location.hostname, not a literal localhost.
     assert "http://localhost" not in html and "http://127.0.0.1" not in html
+    assert "__DASH_PORT__" not in html  # the port placeholder is interpolated at serve time
+    assert "/api/plugins/agent_browser/dashboard" in html  # the start/stop control
 
 
 def test_panel_page_minimal_mode_uses_gated_data_routes():
     from fastapi.testclient import TestClient
 
-    html = TestClient(_app({"panel_mode": "minimal"})).get("/plugins/agent_browser/panel").text
+    html = TestClient(_app({"panel_mode": "minimal", "dashboard_port": 4933})).get(
+        "/plugins/agent_browser/panel"
+    ).text
     assert "/api/plugins/agent_browser/shot" in html  # gated screenshot
     assert "/api/plugins/agent_browser/nav" in html  # gated nav
     assert "kit.apiFetch" in html  # authed fetch via the kit
+    # the dashboard control (start it from the UI) + the port placeholder is interpolated
+    assert "/api/plugins/agent_browser/dashboard" in html and "Start dashboard" in html
+    assert "__DASH_PORT__" not in html and "4933" in html
+
+
+def test_default_panel_mode_is_minimal():
+    import yaml
+
+    m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
+    assert m["config"]["panel_mode"] == "minimal"  # the reliable mode is the default now
+    by_key = {f["key"]: f for f in m["settings"]}
+    assert by_key["panel_mode"]["options"][0] == "minimal"  # recommended first
+
+
+def test_dashboard_control_endpoint(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    c = TestClient(_app({"dashboard_port": 4934}))  # nothing listens → status "stopped"
+    st = c.get("/api/plugins/agent_browser/dashboard").json()
+    assert st["running"] is False and st["port"] == 4934
+    # start/stop run the CLI (mocked); bad action is rejected.
+    rec = []
+    monkeypatch.setattr(bp.subprocess, "run", fake_run(record=rec))
+    assert c.post("/api/plugins/agent_browser/dashboard", json={"action": "x"}).json()["ok"] is False
+    assert c.post("/api/plugins/agent_browser/dashboard", json={"action": "start"}).json()["ok"] is True
+    assert ["agent-browser", "dashboard", "start", "--port", "4934"] in rec
+    assert c.post("/api/plugins/agent_browser/dashboard", json={"action": "stop"}).json()["ok"] is True
+    assert ["agent-browser", "dashboard", "stop"] in rec
 
 
 def test_shot_route_503s_without_a_frame(monkeypatch):

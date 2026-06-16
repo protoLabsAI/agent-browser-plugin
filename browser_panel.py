@@ -62,7 +62,8 @@ def build_panel_router(cfg: dict | None):
 
     @router.get("/panel")
     async def _panel():
-        return HTMLResponse(_MINIMAL_PAGE if mode == "minimal" else _FULL_PAGE)
+        page = _MINIMAL_PAGE if mode == "minimal" else _FULL_PAGE
+        return HTMLResponse(page.replace("__DASH_PORT__", str(port)))
 
     # The minimal-mode shot/nav DATA routes moved to build_panel_data_router —
     # gated under /api/plugins/agent_browser (plugin-view rule 2). The /panel/dash
@@ -193,6 +194,7 @@ def build_panel_data_router(cfg: dict | None):
     cfg = cfg or {}
     binary = str(cfg.get("binary") or "agent-browser")
     timeout = float(cfg.get("timeout_s", 60))
+    port = int(cfg.get("dashboard_port", 4848))
 
     router = APIRouter()
 
@@ -235,6 +237,34 @@ def build_panel_data_router(cfg: dict | None):
             return JSONResponse({"ok": False, "error": f"bad action {action!r}"})
         return JSONResponse({"ok": rc == 0, "error": "" if rc == 0 else err[:200]})
 
+    # ── dashboard control (start it up entirely from the panel UI) ──────────────
+    # The agent-browser dashboard is a standalone daemon. These let the panel show its
+    # status and start/stop it without dropping to a terminal. Status is a live probe of
+    # the daemon's loopback port (there's no `dashboard status` subcommand).
+    @router.get("/dashboard")
+    async def _dash_status():
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as c:
+                await c.get(f"http://127.0.0.1:{port}/")
+            running = True
+        except Exception:  # noqa: BLE001 — connection refused / down → not running
+            running = False
+        return JSONResponse({"running": running, "port": port})
+
+    @router.post("/dashboard")
+    async def _dash_control(body: dict = Body(...)):
+        """Start or stop the dashboard daemon from the UI. `action` is start|stop."""
+        action = str(body.get("action", "")).strip().lower()
+        if action == "start":
+            rc, err = await asyncio.to_thread(lambda: _run("dashboard", "start", "--port", str(port)))
+        elif action == "stop":
+            rc, err = await asyncio.to_thread(lambda: _run("dashboard", "stop"))
+        else:
+            return JSONResponse({"ok": False, "error": f"action must be start|stop, got {action!r}"})
+        return JSONResponse({"ok": rc == 0, "error": "" if rc == 0 else err[:200], "port": port})
+
     return router
 
 
@@ -257,32 +287,61 @@ _FULL_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .bar{height:30px;display:flex;align-items:center;gap:8px;padding:0 12px;color:var(--pl-color-fg-muted);
     font-size:11.5px;border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
   .bar b{color:var(--pl-color-accent)} a{color:var(--pl-color-accent)}
+  .bar .grow{flex:1}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+  .dot.ok{background:#22c55e}.dot.off{background:var(--pl-color-fg-muted,#9aa0aa)}
   iframe{display:block;width:100%;height:calc(100% - 30px);border:0;background:var(--pl-color-bg)}
 </style></head><body>
 <script>
-// Same-origin base: "" on the host, "/agents/<slug>" when served through the fleet
-// proxy. Prefix EVERY asset / iframe-src / link with it — never hardcode an absolute
-// path or a localhost:PORT origin (issue #6 — breaks the proxy + the token handshake).
+// Same-origin base: "" on the host, "/agents/<slug>" when served through the fleet proxy.
 const BASE=location.pathname.split("/plugins/")[0];
 document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";   // DS kit, same-origin
 const DASH=BASE+"/plugins/agent_browser/panel/dash/";                // reverse-proxied dashboard
+const DASH_PORT=__DASH_PORT__;
+function dashOpenUrl(){ return "http://"+location.hostname+":"+DASH_PORT+"/"; }
 </script>
-  <div class="bar"><b>Browser</b><span>agent-browser dashboard
-    · <a id="dashlink" href="#" target="_blank">open</a></span>
-    <span style="margin-left:auto">run <code>agent-browser dashboard start</code> if blank</span></div>
+  <div class="bar"><b>Browser</b>
+    <span id="dash" title="agent-browser dashboard"></span>
+    <span class="grow"></span>
+    <span>blank? the embedded dashboard can't load through a sub-path proxy —
+      <a href="" id="openlink" target="_blank" rel="noopener">open it directly ↗</a> or set panel_mode: minimal</span></div>
   <iframe id="f"></iframe>
 <script type="module">
-document.getElementById("dashlink").href=DASH;
+document.getElementById("openlink").href=dashOpenUrl();
 document.getElementById("f").src=DASH;
 // The DS plugin-kit owns theming THIS page's chrome (the handshake + live
 // re-themes onto --pl-*); it's an ES MODULE, so dynamic import (a classic
 // <script src> throws on its exports). The thin relay below stays: the embedded
 // third-party dashboard wants the RAW console message, which the kit doesn't
 // re-broadcast.
-try { (await import(BASE + "/_ds/plugin-kit.js")).initPluginView(); } catch (e) {}
+let kit;
+try { kit = await import(BASE + "/_ds/plugin-kit.js"); kit.initPluginView(); }
+catch (e) { kit = { apiFetch: (p, i) => fetch(BASE + p, i) }; }
 window.addEventListener("message",(e)=>{const d=e.data||{};
   if(d.type==="protoagent:init"||d.type==="protoagent:theme"){
     const f=document.getElementById("f"); try{f.contentWindow.postMessage(d,"*")}catch(_){} }});
+
+// Dashboard control — status + start/stop from the panel (no terminal). Reload the iframe
+// after a start so a freshly-started dashboard appears without a manual refresh.
+function renderDash(running){
+  const el=document.getElementById("dash"); if(running===null){ el.innerHTML=""; return; }
+  el.innerHTML = running
+    ? '<span class="dot ok"></span> running <button class="pl-btn pl-btn--ghost pl-btn--sm" onclick="dashAct(\'stop\')">Stop</button>'
+    : '<span class="dot off"></span> stopped <button class="pl-btn pl-btn--sm" onclick="dashAct(\'start\')">Start dashboard</button>';
+}
+async function dashStatus(){
+  try{ const r=await kit.apiFetch("/api/plugins/agent_browser/dashboard"); const d=await r.json();
+    renderDash(!!d.running); }catch(_){ renderDash(null); }
+}
+async function dashAct(action){
+  document.getElementById("dash").innerHTML='<span class="dot off"></span> …';
+  try{ await kit.apiFetch("/api/plugins/agent_browser/dashboard",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({action})}); }catch(_){}
+  if(action==="start") setTimeout(()=>{ document.getElementById("f").src=DASH; }, 1200);
+  setTimeout(dashStatus, 900);
+}
+window.dashAct=dashAct;
+dashStatus(); setInterval(dashStatus, 6000);
 </script></body></html>"""
 
 
@@ -308,6 +367,9 @@ document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
     overflow:auto;background:var(--pl-color-bg-inset)}
   img{max-width:100%;display:block}
   .stage .pl-empty{margin:auto}
+  .dash{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--pl-color-fg-muted);margin-left:4px}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+  .dot.ok{background:#22c55e}.dot.off{background:var(--pl-color-fg-muted,#9aa0aa)}
 </style></head><body>
   <div class="bar">
     <button class="pl-btn pl-btn--ghost pl-btn--icon pl-btn--sm" title="Back" onclick="nav('back')">◀</button>
@@ -315,6 +377,7 @@ document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
     <button class="pl-btn pl-btn--ghost pl-btn--icon pl-btn--sm" title="Reload" onclick="nav('reload')">⟳</button>
     <input id="url" class="pl-input" placeholder="example.com — Enter to open" autocomplete="off">
     <button class="pl-btn pl-btn--primary pl-btn--sm" onclick="go()">Go</button>
+    <span id="dash" class="dash" title="agent-browser dashboard"></span>
   </div>
   <div class="stage"><img id="screen" alt="">
     <div id="hint" class="pl-empty pl-empty--slotted">
@@ -356,11 +419,36 @@ async function refresh(){
   }catch(_){}
   busy=false;
 }
+// Dashboard control — start/stop the agent-browser dashboard daemon from the UI (no
+// terminal), show its status, and link out to it. The rich dashboard can't be EMBEDDED
+// through our sub-path proxy (its Next.js assets are root-absolute), so "Dashboard ↗"
+// opens it at its own origin in a new tab — which works on a local/host setup.
+var dashPort=__DASH_PORT__;
+function dashOpenUrl(){ return "http://"+location.hostname+":"+dashPort+"/"; }
+async function dashStatus(){
+  try{ var r=await kit.apiFetch("/api/plugins/agent_browser/dashboard"); var d=await r.json();
+    dashPort=d.port||dashPort; renderDash(!!d.running); }catch(_){ renderDash(null); }
+}
+function renderDash(running){
+  var el=$("dash"); if(running===null){ el.innerHTML=""; return; }
+  var open='<a class="pl-btn pl-btn--ghost pl-btn--sm" href="'+dashOpenUrl()+'" target="_blank" rel="noopener" title="Open the full dashboard (viewport + activity/console/network feeds) in a new tab">Dashboard ↗</a>';
+  el.innerHTML = running
+    ? '<span class="dot ok"></span>'+open+'<button class="pl-btn pl-btn--ghost pl-btn--sm" onclick="dashAct(\'stop\')" title="Stop the dashboard daemon">Stop</button>'
+    : '<span class="dot off"></span><button class="pl-btn pl-btn--sm" onclick="dashAct(\'start\')" title="Start the agent-browser dashboard daemon">Start dashboard</button>';
+}
+async function dashAct(action){
+  var el=$("dash"); el.innerHTML='<span class="dot off"></span>…';
+  try{ await kit.apiFetch("/api/plugins/agent_browser/dashboard",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({action})}); }catch(_){}
+  setTimeout(dashStatus,800);
+}
+window.dashAct=dashAct;
+
 // Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
 // protoagent:init, so the gated shot/nav calls authenticate) or a short timer
 // for the no-handshake case (standalone page / older host).
 let booted=false;
-function boot(){ if(booted)return; booted=true; refresh(); setInterval(refresh,1200); }
+function boot(){ if(booted)return; booted=true; refresh(); setInterval(refresh,1200); dashStatus(); setInterval(dashStatus,6000); }
 kit.initPluginView(boot);
 setTimeout(boot, 800);
 </script></body></html>"""

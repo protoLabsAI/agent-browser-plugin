@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.0
+- **The Browser panel works out of the box now.** The default `panel_mode` is **`minimal`** — a
+  live screenshot + nav toolbar driven through the gated same-origin routes; it works everywhere
+  (host + member), no dashboard daemon needed. `full` mode embeds agent-browser's own dashboard,
+  but that dashboard is a Next.js app whose assets are **root-absolute** (`/_next/...`), so it
+  **can't render through a sub-path reverse proxy** — that was the long-standing blank panel.
+  Full mode now says so and links out to the dashboard's own origin ("open directly ↗").
+- **Start the dashboard from the UI** — a live status dot + **Start / Stop** control in the panel
+  (gated `GET`/`POST /api/plugins/agent_browser/dashboard`), so you never need a terminal. Verified
+  end-to-end against the real `agent-browser` binary (status → start → running → stop).
+
 ## v0.3.0
 - **Host-free test suite** (`tests/`) — the tool subprocess wrappers (arg-building +
   graceful error degradation), the panel routers (page / four-rules / gating / dashboard
