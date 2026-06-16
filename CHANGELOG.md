@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.1
+- **Full mode: an "Open ↗" button** to pop the dashboard out into a full browser tab, alongside the
+  inline embed. Shown whenever the dashboard is on this machine (loopback host) — including over an
+  https console, where the new-tab nav reaches the http dashboard even though the embedded frame
+  can't.
+
 ## v0.5.0
 - **`full` is the default again, and it embeds the dashboard inline.** Full mode iframes
   agent-browser's dashboard at its own **local origin** (`http://<host>:<port>/`) — so on a local
