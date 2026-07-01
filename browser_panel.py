@@ -94,23 +94,49 @@ def build_panel_data_router(cfg: dict | None):
             await ws.send_json({"t": "error", "msg": note})
             await ws.close()
             return
-        dims: dict = {"wh": None}
+        # Coalescing delivery: on_frame just stashes the NEWEST frame and signals; a sender
+        # task drains it. Under load this DROPS stale frames instead of letting ws.send_bytes
+        # block — the backpressure buildup was what stalled the socket (frozen frames → the
+        # proxy idle-closes it → the "live" dot flaps offline).
+        latest: dict = {"jpeg": None, "wh": None}
+        pending = asyncio.Event()
 
         async def on_frame(jpeg: bytes, md: dict):
-            wh = (md.get("deviceWidth"), md.get("deviceHeight"))
-            try:
-                if wh != dims["wh"]:
-                    dims["wh"] = wh
-                    await ws.send_json({"t": "meta", "w": wh[0], "h": wh[1]})
-                await ws.send_bytes(jpeg)
-            except Exception:  # noqa: BLE001 — client vanished mid-frame; teardown follows
-                return
+            latest["jpeg"] = jpeg
+            latest["wh"] = (md.get("deviceWidth"), md.get("deviceHeight"))
+            pending.set()
 
+        async def sender():
+            sent_wh = None
+            try:
+                while True:
+                    await pending.wait()
+                    pending.clear()
+                    jpeg, wh = latest["jpeg"], latest["wh"]
+                    if jpeg is None:
+                        continue
+                    if wh != sent_wh:
+                        sent_wh = wh
+                        await ws.send_json({"t": "meta", "w": wh[0], "h": wh[1]})
+                    await ws.send_bytes(jpeg)
+            except Exception:  # noqa: BLE001 — client gone / cancelled on teardown
+                pass
+
+        send_task = None
         try:
             async with browser_stream.CDPStream(page_ws, on_frame, quality=quality) as cdp:
                 await cdp.start_screencast()
+                send_task = asyncio.create_task(sender())
                 while True:
-                    await cdp.dispatch(await ws.receive_json())
+                    # race operator input against the CDP socket dying — if the page target
+                    # goes away, break so the client reconnects to the live page fast.
+                    recv = asyncio.create_task(ws.receive_json())
+                    done, _ = await asyncio.wait({recv, cdp.reader_task},
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                    if recv not in done:
+                        recv.cancel()
+                        break
+                    await cdp.dispatch(recv.result())
         except WebSocketDisconnect:
             pass
         except Exception:  # noqa: BLE001 — a CDP/stream fault must not take down the worker
@@ -119,6 +145,9 @@ def build_panel_data_router(cfg: dict | None):
                 await ws.close()
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            if send_task:
+                send_task.cancel()
 
     @router.post("/nav")
     async def _nav(body: dict = Body(...)):
@@ -205,6 +234,7 @@ window.nav=nav; window.go=go;
 $("url").addEventListener("keydown",(e)=>{ if(e.key==="Enter") go(); });
 
 function setStatus(s,label){ $("dot").className="dot"+(s?(" "+s):""); $("cs").textContent=label; }
+function live(){ return (devW&&devH) ? ("live · "+devW+"×"+devH) : "live"; }  // show the real viewport size
 function showMsg(t,html){ $("mt").textContent=t; $("md").innerHTML=html||""; $("msg").style.display="flex"; }
 function hideMsg(){ $("msg").style.display="none"; }
 
@@ -237,24 +267,24 @@ async function connect(){
     const ticket=(await r.json()).ticket;
     ws=new WebSocket(wsUrl(ticket));
     ws.binaryType="arraybuffer";
-    ws.onopen=()=>{ connected=true; setStatus("ok","live"); sendResize(); };
+    ws.onopen=()=>{ connected=true; setStatus("ok",live()); sendResize(); setTimeout(sendResize,500); };
     ws.onmessage=onMsg;
     ws.onclose=()=>{ connected=false; setStatus("err","offline"); scheduleRetry(); };
     ws.onerror=()=>{ try{ ws.close(); }catch(_){} };
   }catch(_){ setStatus("err","offline"); scheduleRetry(); }
 }
-function scheduleRetry(){ clearTimeout(retry); retry=setTimeout(connect,2500); }
+function scheduleRetry(){ clearTimeout(retry); retry=setTimeout(connect,1200); }
 async function onMsg(ev){
   if(typeof ev.data==="string"){
     let m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
-    if(m.t==="meta"){ if(m.w) devW=m.w; if(m.h) devH=m.h; }
+    if(m.t==="meta"){ if(m.w) devW=m.w; if(m.h) devH=m.h; setStatus("ok",live()); }
     else if(m.t==="error"){ setStatus("err","no page"); showStart(m.msg); }
     return;
   }
   try{                                   // binary → a JPEG screencast frame
     const bmp=await createImageBitmap(new Blob([ev.data]));
     if(cv.width!==bmp.width||cv.height!==bmp.height){ cv.width=bmp.width; cv.height=bmp.height; }
-    ctx.drawImage(bmp,0,0); bmp.close(); hideMsg(); setStatus("ok","live");
+    ctx.drawImage(bmp,0,0); bmp.close(); hideMsg(); setStatus("ok",live());
   }catch(_){}
 }
 
