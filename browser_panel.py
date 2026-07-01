@@ -165,7 +165,7 @@ document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
     background:var(--pl-color-fg-muted,#9aa0aa)}
   .dot.ok{background:#22c55e}.dot.err{background:#ef4444}
   .stage{height:calc(100% - 38px);position:relative;background:var(--pl-color-bg-inset);overflow:hidden}
-  canvas{width:100%;height:100%;display:block;outline:none;touch-action:none}
+  canvas{width:100%;height:100%;display:block;outline:none;touch-action:none;object-fit:contain}
   #msg{display:none;position:absolute;inset:0;align-items:center;justify-content:center;
     padding:24px;box-sizing:border-box}
   .card{max-width:460px;text-align:center}
@@ -261,8 +261,13 @@ async function onMsg(ev){
 // ── input forwarding: canvas events → CDP Input.dispatch* (coords in CSS px) ────
 function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
 function mods(e){ return {shift:e.shiftKey,ctrl:e.ctrlKey,alt:e.altKey,meta:e.metaKey}; }
+// map a client point → page CSS px, accounting for object-fit:contain letterboxing
+// (the frame's aspect may differ from the canvas box for a moment after a resize).
 function pos(e){ const r=cv.getBoundingClientRect();
-  return { x:(e.clientX-r.left)/r.width*devW, y:(e.clientY-r.top)/r.height*devH }; }
+  const bw=cv.width||devW, bh=cv.height||devH;              // backing store = frame pixels
+  const s=Math.min(r.width/bw, r.height/bh);                // contain scale
+  const dw=bw*s, dh=bh*s, ox=(r.width-dw)/2, oy=(r.height-dh)/2;
+  return { x:(e.clientX-r.left-ox)/dw*devW, y:(e.clientY-r.top-oy)/dh*devH }; }
 const BTN={0:"left",1:"middle",2:"right"};
 cv.addEventListener("mousedown",(e)=>{ e.preventDefault(); cv.focus(); const p=pos(e);
   send({t:"mouse",action:"down",x:p.x,y:p.y,button:BTN[e.button]||"left",clickCount:e.detail||1,buttons:e.buttons,...mods(e)}); });
@@ -288,7 +293,13 @@ let rzTimer=null;
 function panelSize(){ const r=cv.parentElement.getBoundingClientRect();
   return { w:Math.round(r.width), h:Math.round(r.height), dpr:Math.min(window.devicePixelRatio||1, 2) }; }
 function sendResize(){ const s=panelSize(); if(s.w>10 && s.h>10) send({t:"resize",w:s.w,h:s.h,dpr:s.dpr}); }
-new ResizeObserver(()=>{ clearTimeout(rzTimer); rzTimer=setTimeout(sendResize, 180); }).observe(cv.parentElement);
+new ResizeObserver(()=>{ clearTimeout(rzTimer); rzTimer=setTimeout(sendResize, 220); }).observe(cv.parentElement);
+
+// When the panel becomes visible/focused again, the console may have throttled it while
+// hidden — reconnect if the socket dropped, else force a fresh frame so it snaps to current.
+function onVisible(){ if(document.hidden) return; if(!connected) connect(); else { send({t:"refresh"}); sendResize(); } }
+document.addEventListener("visibilitychange", onVisible);
+window.addEventListener("focus", onVisible);
 
 // ── boot ONCE — on the handshake (so apiFetch has the bearer for the gated ticket)
 // or an 800ms fallback for a standalone/older host that posts no init. ──────────

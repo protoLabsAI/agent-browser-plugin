@@ -47,9 +47,11 @@ point.
 
   The viewport is **full-stretch and responsive** — it resizes Chrome's layout viewport to your
   dock's size (× device-pixel-ratio) as you expand/collapse it, so the page reflows to fill rather
-  than sitting as a fixed box, and the screencast **re-arms on every navigation** so you see the
-  agent move through pages and sub-pages (not just the first load). Tune sharpness with
-  `stream_quality`.
+  than sitting as a fixed box (letterboxed with `object-fit` during the resize so it never
+  distorts). The screencast **re-arms on every navigation** so you see the agent move through
+  pages and sub-pages (not just the first load), and it **keeps updating even when the panel isn't
+  focused** (the page is pinned focused/visible over CDP; headed windows launch with
+  anti-backgrounding flags). Tune sharpness with `stream_quality`.
 
   When no page is open the panel shows a **Start button** (not a dead end). Set `home_url` to a
   page and the panel **auto-opens** it — a homepage — otherwise Start opens `about:blank`.

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.2
+- **Keeps live-updating when the panel isn't focused.** The screencast used to stall unless the
+  panel had focus. Fixed on three fronts: the page is now pinned focused/visible over CDP
+  (`Emulation.setFocusEmulationEnabled`) so it never throttles rendering; headed windows launch
+  with anti-backgrounding flags (`--disable-renderer-backgrounding` &co) so an occluded window
+  keeps drawing; and the panel reconnects / forces a fresh frame on `visibilitychange` + `focus`
+  so switching back snaps to current instantly.
+- **Responsive resize no longer distorts or thrashes.** The canvas uses `object-fit: contain`
+  (no more stretched/squished frames while the viewport catches up), input mapping is
+  letterbox-aware, and identical resize observations are deduped server-side so a drag doesn't
+  re-arm the screencast repeatedly. Debounce nudged to 220ms.
+
 ## v0.6.1
 - **Full-stretch, responsive viewport.** The panel now resizes Chrome's layout viewport to
   your dock's size (× device-pixel-ratio) over CDP as you resize/expand/collapse it — the page

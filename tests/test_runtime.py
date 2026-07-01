@@ -12,10 +12,23 @@ def test_default_is_empty():
 
 
 def test_curated_flags_stable_order():
-    f = rt.launch_flags({"headed": True, "profile": "P", "device": "iPhone 16 Pro",
+    # headless keeps the argv clean (headed injects anti-throttle --args, tested separately)
+    f = rt.launch_flags({"profile": "P", "device": "iPhone 16 Pro",
                          "allowed_domains": "x.com", "confirm_actions": "nav", "max_output": 500})
-    assert f == ["--headed", "--profile", "P", "--device", "iPhone 16 Pro",
+    assert f == ["--profile", "P", "--device", "iPhone 16 Pro",
                  "--allowed-domains", "x.com", "--confirm-actions", "nav", "--max-output", "500"]
+
+
+def test_headed_injects_anti_throttle_args():
+    f = rt.launch_flags({"headed": True})
+    assert f[0] == "--headed" and f[1] == "--args"
+    aset = set(f[2].split(","))
+    assert {"--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling"} <= aset  # keep a headed window rendering unfocused
+
+
+def test_headless_stays_clean():
+    assert rt.launch_flags({"allowed_domains": "x.com"}) == ["--allowed-domains", "x.com"]  # no --args
 
 
 def test_stealth_headless_adds_automation_arg_and_real_ua():

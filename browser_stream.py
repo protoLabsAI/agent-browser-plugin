@@ -218,6 +218,7 @@ class CDPStream:
         self._frame_cb = frame_cb
         self._quality = max(1, min(int(quality or 80), 100))
         self._cast = (1280, 800)      # current screencast max frame size (device px)
+        self._last_vp = None          # last applied (css_w, css_h, scale) — dedupe resize thrash
         self._ws = None
         self._id = 0
         self._last_arm = 0.0          # debounce re-arms (multi-frame pages fire many events)
@@ -250,21 +251,33 @@ class CDPStream:
 
     async def start_screencast(self, max_w: int = 1280, max_h: int = 800):
         await self._send("Page.enable")   # also enables frameNavigated / loadEventFired for re-arm
+        # Treat the page as permanently focused + visible. Otherwise Chrome throttles rendering
+        # when the page isn't the focused surface, and the screencast stalls until the operator
+        # clicks back into the panel ("only live-navigates when focused").
+        await self._send("Emulation.setFocusEmulationEnabled", {"enabled": True})
         self._cast = (max_w, max_h)
         await self._arm_cast()
 
     async def set_viewport(self, w, h, dpr=1.0):
         """Resize Chrome's layout viewport to the panel and re-arm the screencast at the
-        matching frame size — so the page reflows to fill, and stays crisp."""
+        matching frame size — so the page reflows to fill, and stays crisp. Deduped: an
+        unchanged size is a no-op (a drag fires many identical observations)."""
         cw, ch, scale, mw, mh = viewport_metrics(w, h, dpr)
+        if (cw, ch, scale) == self._last_vp:
+            return
+        self._last_vp = (cw, ch, scale)
         await self._send("Emulation.setDeviceMetricsOverride",
                          {"width": cw, "height": ch, "deviceScaleFactor": scale, "mobile": False})
         self._cast = (mw, mh)
         await self._arm_cast()
 
     async def dispatch(self, msg: dict):
-        if msg.get("t") == "resize":
+        t = msg.get("t")
+        if t == "resize":
             await self.set_viewport(msg.get("w"), msg.get("h"), msg.get("dpr", 1))
+            return
+        if t == "refresh":                 # panel became visible again → force a fresh frame
+            await self._arm_cast()
             return
         cmd = input_to_cdp(msg)
         if cmd:

@@ -26,10 +26,11 @@ def _toolmap(cfg=None):
 async def test_open_passes_url_and_curated_launch_flags(monkeypatch):
     rec = []
     monkeypatch.setattr(tools.subprocess, "run", fake_run(stdout="OPENED", record=rec))
-    t = _toolmap({"binary": "ab", "headed": True, "allowed_domains": "x.com", "max_output": 500})
+    # headless so argv is clean (headed injects anti-throttle --args; covered in test_runtime)
+    t = _toolmap({"binary": "ab", "allowed_domains": "x.com", "max_output": 500})
     out = await t["browser_open"].ainvoke({"url": "https://x.com"})
     assert "OPENED" in out
-    assert rec[-1] == ["ab", "--headed", "--allowed-domains", "x.com", "--max-output", "500", "open", "https://x.com"]
+    assert rec[-1] == ["ab", "--allowed-domains", "x.com", "--max-output", "500", "open", "https://x.com"]
 
 
 async def test_open_blank_url_omits_it(monkeypatch):
@@ -159,6 +160,8 @@ def test_panel_page_wires_canvas_stream_and_input():
     assert 'u.protocol==="https:" ? "wss:" : "ws:"' in html  # http→ws upgrade
     assert 'send({t:"mouse"' in html and 'send({t:"key"' in html  # input forwarding
     assert "ResizeObserver" in html and 'send({t:"resize"' in html  # responsive viewport tracking
+    assert "object-fit:contain" in html  # no distortion during resize
+    assert "visibilitychange" in html and 'send({t:"refresh"' in html  # refresh when re-shown
     assert "/api/plugins/agent_browser/nav" in html and "kit.apiFetch" in html  # nav via gated route
     assert "startBrowser" in html and 'const HOME="";' in html  # empty-state Start; blank home default
     # the removed dashboard-embed / screenshot modes leave no trace:
