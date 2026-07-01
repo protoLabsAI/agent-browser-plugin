@@ -238,6 +238,13 @@ class CDPStream:
         if self._ws:
             await self._ws.close()
 
+    @property
+    def reader_task(self):
+        """The background CDP read loop; it completes when Chrome's page socket closes
+        (tab gone / target replaced). The route races it so a dead stream reconnects fast
+        instead of freezing until an idle-close."""
+        return self._reader
+
     async def _send(self, method: str, params: dict | None = None) -> int:
         async with self._lock:  # serialize writes: reader (acks/re-arm) + request task (input/resize)
             self._id += 1

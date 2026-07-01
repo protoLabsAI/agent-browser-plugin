@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.3
+- **Stop the "live" dot flapping offline.** The stream now delivers frames by **coalescing to
+  the newest** — under load it drops stale frames instead of letting `send` block, which was
+  building backpressure until the socket idle-closed and reconnected in a loop. The route also
+  **races operator input against the CDP socket dying**, so if the page target goes away the panel
+  reconnects to the live page in ~1.2s instead of freezing. Faster reconnect backoff.
+- **Live viewport size in the status bar** — the "live" pill now reads `live · <w>×<h>` so you can
+  see exactly what size the browser is rendering at (and tell whether the panel-fit is landing).
+- **Resize self-corrects** — the panel re-sends its size shortly after connecting, in case the
+  dock hadn't finished laying out when the socket opened.
+
 ## v0.6.2
 - **Keeps live-updating when the panel isn't focused.** The screencast used to stall unless the
   panel had focus. Fixed on three fronts: the page is now pinned focused/visible over CDP

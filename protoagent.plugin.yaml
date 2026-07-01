@@ -1,6 +1,6 @@
 id: agent_browser
 name: Agent Browser
-version: 0.6.2
+version: 0.6.3
 description: >-
   Browser automation for protoAgent, backed by **agent-browser** (vercel-labs) — a
   fast native-Rust CLI/daemon that drives Chrome over CDP with accessibility-tree
