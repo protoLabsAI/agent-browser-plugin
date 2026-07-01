@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.6.0
+- **The Browser panel is now a fully interactive, drivable viewport — and it is the ONLY mode.**
+  A live **CDP screencast** — event-driven JPEG frames (not a screenshot poll) painted on a
+  `<canvas>` — forwards your **mouse, keyboard, and scroll** back into the page via
+  `Input.dispatch*`. You can click, type, and scroll the real browser from the console, right
+  alongside the agent. Because every byte is a **gated same-origin WebSocket**, it works on the
+  host **and** a remote fleet member.
+- **How it works.** A second CDP client attaches to the same Chrome agent-browser drives (via
+  `agent-browser get cdp-url`); `browser_stream.py` bridges `Page.startScreencast` ⇆ the panel.
+  The nav toolbar (url / back / forward / reload) reuses the gated HTTP `/nav` route.
+- **Start button + configurable homepage.** When no page is open, the panel shows a **Start
+  button** instead of a dead end. A new `home_url` config sets the page it opens to: when set,
+  the panel **auto-opens** it (and the button reads “Open <host>”); blank → the button opens
+  `about:blank`. Editable in Settings ▸ Plugins.
+- **WebSocket auth.** The host's operator-bearer gate is HTTP-only and does **not** cover WS
+  handshakes, so the stream self-gates: the panel mints a **single-use ticket** from the gated
+  `POST /stream-ticket` (bearer-checked) and presents it on the WS URL; the handler validates and
+  burns it. Safe in gated deployments, transparent in open ones.
+- **Full switchover — the old dashboard-embed approach is removed** (no backward compatibility):
+  - `panel_mode` is gone (there is one panel now); so is the screenshot `minimal` mode and its
+    `/shot` route, and the `full` dashboard-embed page.
+  - The **`browser_dashboard` tool is removed** (16 tools now) along with the boot/shutdown
+    **dashboard lifecycle** (`lifecycle.py`) and the panel's `/dashboard` control routes.
+  - Removed config: `panel_mode`, `dashboard_port`, `manage_dashboard`. The interactive panel
+    talks CDP directly and never needs agent-browser's separate dashboard daemon.
+
 ## v0.5.1
 - **Full mode: an "Open ↗" button** to pop the dashboard out into a full browser tab, alongside the
   inline embed. Shown whenever the dashboard is on this machine (loopback host) — including over an

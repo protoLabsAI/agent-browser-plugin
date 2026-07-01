@@ -25,7 +25,6 @@ def get_browser_tools(cfg: dict | None):
     cfg = cfg or {}
     binary = str(cfg.get("binary") or "agent-browser")
     timeout = float(cfg.get("timeout_s", 60))
-    port = int(cfg.get("dashboard_port", 4848))
 
     def _launch_flags() -> list[str]:
         """Curated runtime knobs → agent-browser global flags, applied when the
@@ -146,7 +145,7 @@ def get_browser_tools(cfg: dict | None):
         Use sparingly — prefer snapshot + the action tools."""
         return await _ab("eval", expression)
 
-    # ── capture + lifecycle ───────────────────────────────────────────────────
+    # ── capture + session ─────────────────────────────────────────────────────
     @tool
     async def browser_screenshot(path: str = "page.png") -> str:
         """Save a screenshot of the current page to `path`. Returns the file path."""
@@ -157,20 +156,9 @@ def get_browser_tools(cfg: dict | None):
         """Close the browser session. Call when the task is done to free the daemon."""
         return await _ab("close")
 
-    @tool
-    async def browser_dashboard(action: str = "start") -> str:
-        """Manage the live observability dashboard (the Browser panel embeds it).
-        `action` is `start` (background, port from config), `stop`, or `status`."""
-        act = (action or "start").strip().lower()
-        if act not in ("start", "stop", "status"):
-            return f"Error: action must be start|stop|status, got {action!r}"
-        if act == "start":
-            return await _ab("dashboard", "start", "--port", str(port))
-        return await _ab("dashboard", act)
-
     return [
         browser_open, browser_back, browser_forward, browser_reload,
         browser_snapshot, browser_get_text, browser_get_html, browser_get_value,
         browser_click, browser_fill, browser_type, browser_press, browser_hover,
-        browser_eval, browser_screenshot, browser_close, browser_dashboard,
+        browser_eval, browser_screenshot, browser_close,
     ]

@@ -1,14 +1,15 @@
 id: agent_browser
 name: Agent Browser
-version: 0.5.1
+version: 0.6.0
 description: >-
   Browser automation for protoAgent, backed by **agent-browser** (vercel-labs) — a
   fast native-Rust CLI/daemon that drives Chrome over CDP with accessibility-tree
   snapshots and compact `@eN` element refs. Wraps the CLI as tools (open, snapshot,
   click, fill, type, screenshot, …), ships a discovery skill that defers to the
   CLI's always-current workflow content, browser workflows, and a **Browser panel**
-  console view that embeds agent-browser's own live dashboard (the viewport +
-  activity/console/network feeds).
+  console view — a fully interactive, drivable viewport (live CDP screencast + mouse/
+  keyboard/scroll over a gated same-origin WebSocket), so you can click and type in the
+  page alongside the agent.
 
   Requires the **`agent-browser`** binary on PATH (`npm i -g agent-browser &&
   agent-browser install`). Ships DISABLED; enable with
@@ -21,17 +22,10 @@ min_protoagent_version: "0.27.0"
 config_section: agent_browser
 config:
   binary: agent-browser     # the agent-browser CLI on PATH (override for a pinned path)
-  dashboard_port: 4848      # agent-browser dashboard start --port; full-mode panel iframes this
   timeout_s: 60             # per-command subprocess timeout
-  panel_mode: full          # Browser panel layout. `full` (default): embed agent-browser's own
-                            # dashboard (viewport + activity/console/network feeds) at its local
-                            # origin — best for a LOCAL setup (console + agent-browser on one box).
-                            # When the console is opened remotely (a fleet member, a non-loopback
-                            # host, or over https) the dashboard's localhost isn't reachable from
-                            # your browser, so the panel shows a clear error — use `minimal` there.
-                            # `minimal`: a screenshot viewport + nav toolbar driven through the
-                            # gated same-origin routes; works everywhere, no daemon needed. Both
-                            # modes can start/stop the dashboard from the panel.
+  home_url: ""              # homepage the panel opens to. When set, the panel auto-opens it if
+                            # no browser page is open; the empty state also shows a Start button.
+                            # Blank → the Start button opens about:blank (no auto-open).
   # Runtime / launch options — a curated set passed to `agent-browser open` so you can
   # shape and lock down the browser the agent spins up. Blank/0/false = CLI default.
   headed: false             # show a real browser window instead of headless
@@ -40,24 +34,20 @@ config:
   allowed_domains: ""       # comma-separated navigable-domain whitelist (e.g. "example.com,*.foo.com")
   confirm_actions: ""       # comma-separated action categories that require confirmation
   max_output: 0             # cap page-text output chars (LLM-safety); 0 = CLI default
-  manage_dashboard: true    # own the dashboard lifecycle (ADR 0018): start it on boot, stop it on
-                            # shutdown. Set false to leave a shared/persistent dashboard untouched.
 
 # Editable in Settings ▸ Plugins (ADR 0019) — the operator knobs above as UI fields.
 settings:
-  - { key: panel_mode, label: "Browser panel mode", type: select, options: [full, minimal], description: "full (default): embed agent-browser's dashboard (viewport + activity/console/network feeds) at its local origin — for a local setup (console + agent-browser on one machine). Opened remotely (a fleet member / non-loopback host / https), it shows a clear error instead of a blank frame. minimal: a screenshot viewport + nav toolbar via gated same-origin routes — works everywhere, no daemon. Both can start/stop the dashboard from the panel." }
+  - { key: home_url, label: "Homepage URL", type: string, description: "The page the interactive panel opens to. When set, it auto-opens if no browser page is open, and the empty state shows a Start button. Blank = a Start button that opens about:blank." }
   - { key: headed, label: "Headed browser", type: bool, description: "Show a real browser window instead of running headless." }
   - { key: allowed_domains, label: "Allowed domains", type: string, description: "Comma-separated navigable-domain allowlist (e.g. example.com,*.foo.com). Blank = unrestricted." }
   - { key: confirm_actions, label: "Confirm actions", type: string, description: "Comma-separated action categories that require confirmation before the agent runs them." }
   - { key: profile, label: "Browser profile dir", type: string, description: "Path to a browser profile directory — isolation + persisted auth/cookies across sessions." }
   - { key: device, label: "Device emulation", type: string, description: "Emulate a device, e.g. \"iPhone 16 Pro\". Blank = desktop." }
   - { key: max_output, label: "Max page-text output (chars)", type: number, description: "Cap characters of page text returned to the model (LLM-safety). 0 = the CLI default." }
-  - { key: dashboard_port, label: "Dashboard port", type: number, description: "Port for agent-browser's dashboard daemon; the full-mode panel reverse-proxies it." }
   - { key: timeout_s, label: "Command timeout (s)", type: number, description: "Per-command subprocess timeout for the browser tools." }
-  - { key: manage_dashboard, label: "Manage dashboard lifecycle", type: bool, description: "Start the dashboard on boot and stop it on shutdown. Turn off to leave a shared/persistent dashboard untouched." }
   - { key: binary, label: "agent-browser binary", type: string, description: "The agent-browser CLI on PATH (override with a pinned absolute path if needed)." }
 
-# Console view (ADR 0026) — embeds agent-browser's live dashboard (viewport + feeds).
+# Console view (ADR 0026) — an interactive, drivable browser viewport (CDP screencast + input).
 views:
   - { id: panel, label: "Browser", icon: Globe, path: /plugins/agent_browser/panel }
 
