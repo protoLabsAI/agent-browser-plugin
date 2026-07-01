@@ -18,6 +18,8 @@ import subprocess
 
 from langchain_core.tools import tool
 
+from .runtime import launch_flags
+
 log = logging.getLogger("protoagent.plugins.agent_browser")
 
 
@@ -25,24 +27,6 @@ def get_browser_tools(cfg: dict | None):
     cfg = cfg or {}
     binary = str(cfg.get("binary") or "agent-browser")
     timeout = float(cfg.get("timeout_s", 60))
-
-    def _launch_flags() -> list[str]:
-        """Curated runtime knobs → agent-browser global flags, applied when the
-        session launches (on `open`). Blank/0/false → omitted (CLI default)."""
-        f: list[str] = []
-        if cfg.get("headed"):
-            f.append("--headed")
-        if str(cfg.get("profile") or "").strip():
-            f += ["--profile", str(cfg["profile"]).strip()]
-        if str(cfg.get("device") or "").strip():
-            f += ["--device", str(cfg["device"]).strip()]
-        if str(cfg.get("allowed_domains") or "").strip():
-            f += ["--allowed-domains", str(cfg["allowed_domains"]).strip()]
-        if str(cfg.get("confirm_actions") or "").strip():
-            f += ["--confirm-actions", str(cfg["confirm_actions"]).strip()]
-        if int(cfg.get("max_output", 0) or 0) > 0:
-            f += ["--max-output", str(int(cfg["max_output"]))]
-        return f
 
     def _run(*args: str) -> str:
         """Run `agent-browser <args>` and return stdout, or a readable error."""
@@ -67,9 +51,9 @@ def get_browser_tools(cfg: dict | None):
     async def browser_open(url: str = "") -> str:
         """Launch the browser (or navigate the current session). Pass a `url` to go
         there, or leave blank to open about:blank. Start every browsing task here.
-        The configured runtime options (headed/profile/device/allowed_domains/…)
+        The configured runtime options (headed/profile/device/allowed_domains/stealth/…)
         are applied here, where the session launches."""
-        flags = _launch_flags()
+        flags = launch_flags(cfg)
         return await _ab(*flags, "open", url) if url else await _ab(*flags, "open")
 
     @tool

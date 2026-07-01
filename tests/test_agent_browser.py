@@ -158,6 +158,7 @@ def test_panel_page_wires_canvas_stream_and_input():
     assert "/api/plugins/agent_browser/stream" in html  # the WS stream
     assert 'u.protocol==="https:" ? "wss:" : "ws:"' in html  # http→ws upgrade
     assert 'send({t:"mouse"' in html and 'send({t:"key"' in html  # input forwarding
+    assert "ResizeObserver" in html and 'send({t:"resize"' in html  # responsive viewport tracking
     assert "/api/plugins/agent_browser/nav" in html and "kit.apiFetch" in html  # nav via gated route
     assert "startBrowser" in html and 'const HOME="";' in html  # empty-state Start; blank home default
     # the removed dashboard-embed / screenshot modes leave no trace:
@@ -229,5 +230,21 @@ def test_nav_route_validates(monkeypatch):
     assert c.post("/api/plugins/agent_browser/nav", json={"action": "bogus"}).json()["ok"] is False
     assert c.post("/api/plugins/agent_browser/nav", json={"action": "open"}).json()["error"] == "url required"
     assert c.post("/api/plugins/agent_browser/nav", json={"action": "reload"}).json()["ok"] is True
+
+
+def test_nav_open_applies_launch_flags(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    rec = []
+    monkeypatch.setattr(bp.subprocess, "run", fake_run(record=rec))
+    # a session started from the panel gets the same headed/stealth setup as the agent's
+    c = TestClient(_app({"headed": True, "stealth": True}))
+    c.post("/api/plugins/agent_browser/nav", json={"action": "open", "url": "https://x.com"})
+    argv = rec[-1]
+    assert argv[-2:] == ["open", "https://x.com"]
+    assert "--headed" in argv and "--args" in argv  # launch flags applied on open
+    # back/forward/reload don't relaunch, so they carry no flags
+    c.post("/api/plugins/agent_browser/nav", json={"action": "reload"})
+    assert rec[-1] == ["agent-browser", "reload"]
 
 
