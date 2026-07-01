@@ -1,3 +1,4 @@
-# No pip deps — the host (protoAgent) provides langchain-core + fastapi. The only
-# external requirement is the `agent-browser` CLI on PATH:
+# No pip deps — the host (protoAgent) provides langchain-core + fastapi, and `websockets`
+# (a uvicorn[standard] extra) which the interactive panel uses to bridge Chrome's CDP.
+# The only external requirement is the `agent-browser` CLI on PATH:
 #   npm i -g agent-browser && agent-browser install

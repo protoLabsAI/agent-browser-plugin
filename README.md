@@ -33,25 +33,21 @@ point.
   `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`,
   `browser_get_text`/`get_html`/`get_value`, `browser_press`, `browser_hover`,
   `browser_eval`, `browser_screenshot`, `browser_back`/`forward`/`reload`,
-  `browser_close`, `browser_dashboard`.
+  `browser_close`.
 - **Skill** — a discovery skill that defers to the CLI's always-current workflow
   content (`agent-browser skills get core`), so instructions never go stale.
 - **Workflows** — declarative browser recipes (browse-and-extract, fill-a-form, …).
-- **Browser panel** — a console view (ADR 0026) for watching/driving the browser. Two
-  modes, set by `panel_mode`:
-  - **`full` (default)** — **embeds agent-browser's dashboard inline** (viewport + activity/
-    console/network feeds) at its own **local origin** (`http://<host>:<port>/`). Best for a
-    **local setup** (console + agent-browser on one machine). Because the dashboard is a
-    Next.js app with root-absolute assets (no base-path), it only loads at its own origin —
-    so when the console is opened **remotely** (a fleet member, a non-loopback host, or over
-    https) its `localhost` isn't reachable from your browser, and the panel shows a **clear
-    error** (pointing you at `minimal`) rather than a blank frame.
-  - **`minimal`** — a **live screenshot** of the viewport + a nav toolbar, all through the
-    **gated same-origin routes**. Works everywhere (host and member), no dashboard daemon
-    needed — use it for a remote/member agent.
+- **Browser panel** — a console view (ADR 0026) that is a **fully drivable viewport**. A live
+  **CDP screencast** (event-driven JPEG frames, not a screenshot poll) is painted on a
+  `<canvas>`, and your **mouse / keyboard / scroll** are forwarded back into the page via
+  `Input.dispatch*` — so you can click, type, and scroll the real browser from the console,
+  alongside the agent. Everything rides a **gated same-origin WebSocket**, so it works on the
+  **host and a remote fleet member** alike. A second CDP client attaches to the same Chrome
+  agent-browser drives (`agent-browser get cdp-url`); `browser_stream.py` does the bridging.
 
-  Either mode can **start the dashboard from the panel** (no terminal) — the Start/Stop
-  control hits the gated `POST /api/plugins/agent_browser/dashboard`.
+  **WebSocket auth:** the host's operator-bearer gate is HTTP-only and doesn't cover WS
+  handshakes, so the stream self-gates — the panel mints a **single-use ticket** from the gated
+  `POST /api/plugins/agent_browser/stream-ticket` and presents it on the WS URL.
 
 ## Requirements
 
@@ -75,7 +71,6 @@ plugins:
 
 agent_browser:
   binary: agent-browser
-  dashboard_port: 4848
 ```
 
 ## Layout
@@ -83,12 +78,12 @@ agent_browser:
 | File | What |
 |---|---|
 | `tools.py` | the browser tools — subprocess wrappers over the `agent-browser` CLI |
-| `browser_panel.py` | the Browser panel — `minimal` (live viewport + nav + dashboard control) and `full` (a launcher for the dashboard) |
-| `lifecycle.py` | the dashboard daemon surface — start on boot, stop on shutdown (ADR 0018) |
+| `browser_panel.py` | the Browser panel page + routes — the interactive canvas + the gated nav / stream-ticket / WS-stream routes |
+| `browser_stream.py` | the CDP bridge — screencast frames out, input in; the WS ticket auth |
 | `skills/` | the discovery skill (defers to `agent-browser skills get core`) |
 | `workflows/` | declarative browser recipes |
 | `tests/` | the host-free pytest suite (subprocess mocked — no binary needed) |
-| `__init__.py` | `register()` — wires tools + panel + lifecycle; skills/workflows auto-discovered |
+| `__init__.py` | `register()` — wires tools + the interactive panel; skills/workflows auto-discovered |
 
 The operator knobs (panel mode, headed, allowed domains, profile, device, …) are editable in
 **Settings ▸ Plugins ▸ Agent Browser**, or under `agent_browser:` in `langgraph-config.yaml`.

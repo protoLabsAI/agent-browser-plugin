@@ -1,15 +1,15 @@
 """Tests for the agent_browser plugin — the tool subprocess wrappers (arg-building +
-graceful error degradation), the panel routers (page / four-rules / gating / proxy),
-register() wiring, the dashboard lifecycle, and manifest/version coherence. Host-free:
-subprocess.run is mocked, so no agent-browser binary and no real browser are needed."""
+graceful error degradation), the interactive panel routes (page / ticket / WS gating /
+nav), register() wiring, and manifest/version coherence. Host-free: subprocess.run is
+mocked, so no agent-browser binary and no real browser are needed."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 
 import agent_browser.browser_panel as bp
-import agent_browser.lifecycle as lc
 import agent_browser.tools as tools
 from conftest import fake_run
 
@@ -51,18 +51,9 @@ async def test_action_tools_pass_refs(monkeypatch):
     assert rec[-1] == ["ab", "snapshot"]
 
 
-async def test_dashboard_tool_validates_action_and_passes_port(monkeypatch):
-    rec = []
-    monkeypatch.setattr(tools.subprocess, "run", fake_run(record=rec))
-    t = _toolmap({"binary": "ab", "dashboard_port": 9000})
-    assert "action must be" in await t["browser_dashboard"].ainvoke({"action": "boom"})
-    await t["browser_dashboard"].ainvoke({"action": "start"})
-    assert rec[-1] == ["ab", "dashboard", "start", "--port", "9000"]
-
-
-def test_all_17_tools_present():
+def test_all_16_tools_present():
     names = set(_toolmap())
-    assert len(names) == 17
+    assert len(names) == 16
     assert {
         "browser_open",
         "browser_snapshot",
@@ -71,8 +62,8 @@ def test_all_17_tools_present():
         "browser_screenshot",
         "browser_eval",
         "browser_close",
-        "browser_dashboard",
     } <= names
+    assert "browser_dashboard" not in names  # the dashboard tool is gone (full switchover)
 
 
 # ── the tools: graceful error degradation (a failed action informs, never crashes) ──
@@ -105,15 +96,15 @@ async def test_nonzero_exit_surfaces_stderr(monkeypatch):
 # ── register() wiring ────────────────────────────────────────────────────────────
 
 
-def test_register_wires_tools_panel_data_and_surface(registry):
+def test_register_wires_tools_and_panel_routers(registry):
     import agent_browser as pkg
 
     pkg.register(registry)
-    assert len(registry.tools) == 17
+    assert len(registry.tools) == 16
     prefixes = [p for p, _ in registry.routers]
     assert None in prefixes  # the panel PAGE (host default prefix /plugins/agent_browser)
     assert "/api/plugins/agent_browser" in prefixes  # gated data routes
-    assert registry.surfaces and registry.surfaces[0][0] == "agent-browser-dashboard"
+    assert registry.surfaces == []  # no dashboard lifecycle surface anymore
 
 
 # ── manifest / version coherence + settings ──────────────────────────────────────
@@ -136,36 +127,15 @@ def test_settings_fields_are_valid_and_back_real_config():
 
     m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     by_key = {f["key"]: f for f in m["settings"]}
-    assert by_key["panel_mode"]["type"] == "select"
-    assert set(by_key["panel_mode"]["options"]) == {"full", "minimal"}
-    assert by_key["headed"]["type"] == "bool" and by_key["dashboard_port"]["type"] == "number"
+    assert by_key["headed"]["type"] == "bool" and by_key["timeout_s"]["type"] == "number"
+    # the switchover dropped these knobs entirely:
+    assert "panel_mode" not in by_key and "dashboard_port" not in by_key
+    assert "panel_mode" not in m["config"] and "manage_dashboard" not in m["config"]
     # every settings key has a declared default in config:
     assert set(by_key) <= set(m["config"])
 
 
-# ── the dashboard lifecycle ──────────────────────────────────────────────────────
-
-
-async def test_lifecycle_starts_on_boot_and_stops_on_shutdown(monkeypatch):
-    rec = []
-    monkeypatch.setattr(lc.subprocess, "run", fake_run(record=rec))
-    start, stop = lc.make_dashboard_surface({"binary": "ab", "dashboard_port": 9999})
-    await start()
-    await stop()
-    assert ["ab", "dashboard", "start", "--port", "9999"] in rec
-    assert ["ab", "dashboard", "stop"] in rec
-
-
-async def test_lifecycle_leaves_shared_dashboard_untouched(monkeypatch):
-    rec = []
-    monkeypatch.setattr(lc.subprocess, "run", fake_run(record=rec))
-    start, stop = lc.make_dashboard_surface({"manage_dashboard": False})
-    await start()
-    await stop()
-    assert rec == []  # manage_dashboard:false → never touches the daemon
-
-
-# ── the panel routers (page / four-rules / gating / proxy) ───────────────────────
+# ── the panel routes (page / ticket / WS gating / nav) ───────────────────────────
 
 
 def _app(cfg=None):
@@ -177,74 +147,64 @@ def _app(cfg=None):
     return app
 
 
-def test_panel_page_full_mode_embeds_local_or_errors():
+def test_panel_page_wires_canvas_stream_and_input():
     from fastapi.testclient import TestClient
 
-    c = TestClient(_app({"panel_mode": "full", "dashboard_port": 4955}))
-    r = c.get("/plugins/agent_browser/panel")
-    assert r.status_code == 200
-    html = r.text
+    html = TestClient(_app({})).get("/plugins/agent_browser/panel").text
     assert "/_ds/plugin-kit.css" in html  # DS kit
     assert 'location.pathname.split("/plugins/")[0]' in html  # slug-aware base
-    assert 'id="f"' in html  # the dashboard iframe
-    assert '"http://"+location.hostname+":"+PORT' in html  # embed the dashboard's OWN local origin
-    assert "LOOPBACK" in html  # local detection (loopback host + not fleet-proxied)
-    assert "Open the console locally" in html  # the clear error shown when NOT local
-    assert "/api/plugins/agent_browser/dashboard" in html  # the start/stop control
-    assert 'id="openlink"' in html and "Open ↗" in html  # open the dashboard in a new tab
-    assert "panel_mode: minimal" in html  # the remote alternative the error points at
-    # the dead sub-path proxy is gone; the port placeholder is interpolated.
-    assert "/panel/dash" not in html
-    assert "__DASH_PORT__" not in html and "4955" in html
+    assert 'id="cv"' in html and "createImageBitmap" in html  # the canvas + frame painting
+    assert "/api/plugins/agent_browser/stream-ticket" in html  # mint a ticket (gated)
+    assert "/api/plugins/agent_browser/stream" in html  # the WS stream
+    assert 'u.protocol==="https:" ? "wss:" : "ws:"' in html  # http→ws upgrade
+    assert 'send({t:"mouse"' in html and 'send({t:"key"' in html  # input forwarding
+    assert "/api/plugins/agent_browser/nav" in html and "kit.apiFetch" in html  # nav via gated route
+    # the removed dashboard-embed / screenshot modes leave no trace:
+    assert "/api/plugins/agent_browser/shot" not in html
+    assert 'id="f"' not in html and "Open the console locally" not in html
 
 
-def test_panel_page_minimal_mode_uses_gated_data_routes():
+def test_stream_ticket_route_mints_a_ticket():
     from fastapi.testclient import TestClient
 
-    html = TestClient(_app({"panel_mode": "minimal", "dashboard_port": 4933})).get(
-        "/plugins/agent_browser/panel"
-    ).text
-    assert "/api/plugins/agent_browser/shot" in html  # gated screenshot
-    assert "/api/plugins/agent_browser/nav" in html  # gated nav
-    assert "kit.apiFetch" in html  # authed fetch via the kit
-    # the dashboard control (start it from the UI) + the port placeholder is interpolated
-    assert "/api/plugins/agent_browser/dashboard" in html and "Start dashboard" in html
-    assert "__DASH_PORT__" not in html and "4933" in html
+    body = TestClient(_app()).post("/api/plugins/agent_browser/stream-ticket").json()
+    assert isinstance(body.get("ticket"), str) and len(body["ticket"]) > 10
 
 
-def test_default_panel_mode_is_full():
-    import yaml
+def test_stream_ws_rejects_a_bad_ticket():
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
 
-    m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
-    assert m["config"]["panel_mode"] == "full"  # embed the dashboard by default (local setup)
-    by_key = {f["key"]: f for f in m["settings"]}
-    assert by_key["panel_mode"]["options"][0] == "full"  # default listed first
+    c = TestClient(_app())
+    # no valid ticket → handler closes (1008) before accept → connect raises.
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect("/api/plugins/agent_browser/stream?ticket=nope"):
+            pass
 
 
-def test_dashboard_control_endpoint(monkeypatch):
+def test_stream_ws_accepts_valid_ticket_then_reports_no_page(monkeypatch):
     from fastapi.testclient import TestClient
 
-    c = TestClient(_app({"dashboard_port": 4934}))  # nothing listens → status "stopped"
-    st = c.get("/api/plugins/agent_browser/dashboard").json()
-    assert st["running"] is False and st["port"] == 4934
-    # start/stop run the CLI (mocked); bad action is rejected.
-    rec = []
-    monkeypatch.setattr(bp.subprocess, "run", fake_run(record=rec))
-    assert c.post("/api/plugins/agent_browser/dashboard", json={"action": "x"}).json()["ok"] is False
-    assert c.post("/api/plugins/agent_browser/dashboard", json={"action": "start"}).json()["ok"] is True
-    assert ["agent-browser", "dashboard", "start", "--port", "4934"] in rec
-    assert c.post("/api/plugins/agent_browser/dashboard", json={"action": "stop"}).json()["ok"] is True
-    assert ["agent-browser", "dashboard", "stop"] in rec
+    # resolve returns no page → the handler accepts, sends an error frame, and closes
+    # (exercises the ticket gate + accept path without a real browser/CDP).
+    monkeypatch.setattr(bp.browser_stream, "resolve_page_target",
+                        lambda binary, timeout: (None, "no page open"))
+    c = TestClient(_app())
+    ticket = c.post("/api/plugins/agent_browser/stream-ticket").json()["ticket"]
+    with c.websocket_connect(f"/api/plugins/agent_browser/stream?ticket={ticket}") as ws:
+        assert ws.receive_json() == {"t": "error", "msg": "no page open"}
 
 
-def test_shot_route_503s_without_a_frame(monkeypatch):
+def test_stream_ticket_is_single_use():
     from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
 
-    monkeypatch.setattr(bp.subprocess, "run", fake_run(rc=127, stderr="not found"))
-    monkeypatch.setattr(bp.os.path, "exists", lambda p: False)  # no cached frame
-    monkeypatch.setattr(bp, "_shot_ts", 0.0)
-    r = TestClient(_app()).get("/api/plugins/agent_browser/shot")
-    assert r.status_code == 503
+    c = TestClient(_app())
+    ticket = c.post("/api/plugins/agent_browser/stream-ticket").json()["ticket"]
+    assert bp.browser_stream.consume_ticket(ticket) is True   # burn it directly
+    with pytest.raises(WebSocketDisconnect):                  # replay is rejected
+        with c.websocket_connect(f"/api/plugins/agent_browser/stream?ticket={ticket}"):
+            pass
 
 
 def test_nav_route_validates(monkeypatch):

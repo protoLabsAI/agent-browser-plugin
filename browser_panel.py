@@ -1,70 +1,55 @@
-"""Browser panel console view (ADR 0026) — two modes, set by ``panel_mode``.
+"""Browser panel console view (ADR 0026) — a **fully drivable** browser viewport.
 
-- ``minimal`` (default): a viewport-only page we render ourselves — a live screenshot
-  (polled from the CLI through the gated /shot route, same-origin, no WS/proxy
-  dependency) + a nav toolbar (url / back / forward / reload) + a Dashboard control
-  (start/stop/status). Works everywhere — host and member alike.
-- ``full``: a launcher for agent-browser's own dashboard (viewport + activity/console/
-  network feeds). We deliberately do NOT embed it: that dashboard is a prebuilt Next.js
-  app whose assets are ROOT-ABSOLUTE (``/_next/…``) with no base-path option, so it can't
-  render under a sub-path reverse proxy (the long-standing blank panel) — it only renders
-  at its OWN origin. Full mode opens it there ("Open dashboard ↗"), which works on a
-  local/host setup; for a remote member, use minimal.
+A live **CDP screencast** (event-driven JPEG frames, not a screenshot poll) is bridged
+from the agent-browser Chrome to a ``<canvas>`` over a **gated same-origin WebSocket**,
+and operator mouse / keyboard / scroll are forwarded back via ``Input.dispatch*`` — so
+you can actually click, type, and scroll the page, alongside the agent. It rides the
+fleet proxy (all bytes are same-origin), so it works on the host AND a remote member.
+Streaming/input lives in ``browser_stream``; this file is the page + the routes.
 
 Self-contained vanilla JS (no build step). Every fetch / link is derived from
 ``base = location.pathname.split("/plugins/")[0]`` (="" on the host, ``/agents/<slug>``
-when proxied) so the page is same-origin + slug-aware (the token/theme handshake). The
-browser is driven only through the CLI behind same-origin routes; the agent's own
-browser_* tools are the primary driver — this is an operator viewport.
+when proxied) so the page is same-origin + slug-aware (the token/theme handshake).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import subprocess
-import tempfile
-import time
 
 # Module-scope fastapi imports (the host always provides fastapi; __init__.py catches
 # ImportError so the tools still serve if the panel can't import).
-from fastapi import APIRouter, Body
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi import APIRouter, Body, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from . import browser_stream
 
 log = logging.getLogger("protoagent.plugins.agent_browser")
 
-_SHOT_PATH = os.path.join(tempfile.gettempdir(), "agent_browser_panel.png")
-_shot_ts = 0.0  # last successful capture (cheap throttle so polling can't storm the CLI)
-
 
 def build_panel_router(cfg: dict | None):
-
-    cfg = cfg or {}
-    port = int(cfg.get("dashboard_port", 4848))
-    mode = str(cfg.get("panel_mode", "minimal")).strip().lower()
-
     router = APIRouter()
 
     @router.get("/panel")
     async def _panel():
-        page = _MINIMAL_PAGE if mode == "minimal" else _FULL_PAGE
-        return HTMLResponse(page.replace("__DASH_PORT__", str(port)))
+        return HTMLResponse(_INTERACTIVE_PAGE)
 
     return router
 
 
 def build_panel_data_router(cfg: dict | None):
-    """The minimal-mode DATA/ACTION routes — mounted under
-    ``/api/plugins/agent_browser`` so they inherit the operator bearer gate
-    (plugin-view rule 2). Previously ``/panel/shot`` + ``POST /panel/nav`` lived
-    under the public ``/plugins/`` prefix: on a token-gated deployment anyone who
-    could reach the port could DRIVE the operator's browser session and read its
-    screen without the bearer."""
+    """The panel DATA/ACTION routes — mounted under ``/api/plugins/agent_browser``.
+    The HTTP routes (``POST /nav``, ``POST /stream-ticket``) inherit the operator bearer
+    gate (plugin-view rule 2), so nobody who lacks the bearer can drive the browser or
+    mint a stream ticket.
+
+    ``WS /stream`` is the exception the host forces on us: its auth middleware is
+    HTTP-only and does NOT cover WebSocket handshakes, so the WS gates itself with the
+    single-use ticket that ``POST /stream-ticket`` (which IS gated) hands out."""
     cfg = cfg or {}
     binary = str(cfg.get("binary") or "agent-browser")
     timeout = float(cfg.get("timeout_s", 60))
-    port = int(cfg.get("dashboard_port", 4848))
 
     router = APIRouter()
 
@@ -77,20 +62,53 @@ def build_panel_data_router(cfg: dict | None):
         except subprocess.TimeoutExpired:
             return 124, "timed out"
 
-    @router.get("/shot")
-    async def _shot():
-        """Latest viewport as a PNG. Throttled to ~1/0.8s so a fast poller can't
-        spawn a screenshot subprocess per frame."""
-        global _shot_ts
-        now = time.monotonic()
-        if now - _shot_ts > 0.8 or not os.path.exists(_SHOT_PATH):
-            rc, err = await asyncio.to_thread(lambda: _run("screenshot", _SHOT_PATH))
-            if rc == 0 and os.path.exists(_SHOT_PATH):
-                _shot_ts = now
-            else:
-                return Response(status_code=503, content=f"no frame: {err[:200]}")
-        return FileResponse(_SHOT_PATH, media_type="image/png",
-                            headers={"Cache-Control": "no-store"})
+    # ── interactive stream: a single-use ticket (gated) + the WS bridge (self-gated) ──
+    @router.post("/stream-ticket")
+    async def _stream_ticket():
+        """Mint a single-use ticket for the interactive WS. HTTP, so it rides the
+        host's operator-bearer gate — only an authenticated console reaches it."""
+        return JSONResponse({"ticket": browser_stream.mint_ticket()})
+
+    @router.websocket("/stream")
+    async def _stream(ws: WebSocket):
+        """Interactive viewport: CDP screencast frames out (binary JPEG), operator
+        input in (JSON → ``Input.dispatch*``). Ticket-gated (the host doesn't gate
+        WS). One sender only — ``on_frame`` — while the loop just receives, so the two
+        directions never race on the socket."""
+        if not browser_stream.consume_ticket(ws.query_params.get("ticket", "")):
+            await ws.close(code=1008)  # policy violation: missing/replayed/expired ticket
+            return
+        await ws.accept()
+        page_ws, note = await asyncio.to_thread(browser_stream.resolve_page_target, binary, timeout)
+        if not page_ws:
+            await ws.send_json({"t": "error", "msg": note})
+            await ws.close()
+            return
+        dims: dict = {"wh": None}
+
+        async def on_frame(jpeg: bytes, md: dict):
+            wh = (md.get("deviceWidth"), md.get("deviceHeight"))
+            try:
+                if wh != dims["wh"]:
+                    dims["wh"] = wh
+                    await ws.send_json({"t": "meta", "w": wh[0], "h": wh[1]})
+                await ws.send_bytes(jpeg)
+            except Exception:  # noqa: BLE001 — client vanished mid-frame; teardown follows
+                return
+
+        try:
+            async with browser_stream.CDPStream(page_ws, on_frame) as cdp:
+                await cdp.start_screencast()
+                while True:
+                    await cdp.dispatch(await ws.receive_json())
+        except WebSocketDisconnect:
+            pass
+        except Exception:  # noqa: BLE001 — a CDP/stream fault must not take down the worker
+            log.exception("[agent_browser] interactive stream failed")
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     @router.post("/nav")
     async def _nav(body: dict = Body(...)):
@@ -107,153 +125,20 @@ def build_panel_data_router(cfg: dict | None):
             return JSONResponse({"ok": False, "error": f"bad action {action!r}"})
         return JSONResponse({"ok": rc == 0, "error": "" if rc == 0 else err[:200]})
 
-    # ── dashboard control (start it up entirely from the panel UI) ──────────────
-    # The agent-browser dashboard is a standalone daemon. These let the panel show its
-    # status and start/stop it without dropping to a terminal. Status is a live probe of
-    # the daemon's loopback port (there's no `dashboard status` subcommand).
-    @router.get("/dashboard")
-    async def _dash_status():
-        try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as c:
-                await c.get(f"http://127.0.0.1:{port}/")
-            running = True
-        except Exception:  # noqa: BLE001 — connection refused / down → not running
-            running = False
-        return JSONResponse({"running": running, "port": port})
-
-    @router.post("/dashboard")
-    async def _dash_control(body: dict = Body(...)):
-        """Start or stop the dashboard daemon from the UI. `action` is start|stop."""
-        action = str(body.get("action", "")).strip().lower()
-        if action == "start":
-            rc, err = await asyncio.to_thread(lambda: _run("dashboard", "start", "--port", str(port)))
-        elif action == "stop":
-            rc, err = await asyncio.to_thread(lambda: _run("dashboard", "stop"))
-        else:
-            return JSONResponse({"ok": False, "error": f"action must be start|stop, got {action!r}"})
-        return JSONResponse({"ok": rc == 0, "error": "" if rc == 0 else err[:200], "port": port})
-
     return router
 
 
-# ── full mode (default): embed agent-browser's dashboard at its OWN origin ──────
-# The dashboard is a Next.js app with root-absolute assets (no base-path), so it only
-# renders at its own origin (http://<host>:<port>/) — never under a sub-path proxy. Full
-# mode therefore ASSUMES A LOCAL setup (console + agent-browser on one machine) and iframes
-# that loopback origin directly. When the console is opened remotely (a fleet member, or a
-# non-loopback host, or over https) that loopback dashboard isn't reachable from the
-# operator's browser — we DETECT that and show a clear error instead of a blank frame.
-_FULL_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+# ── the interactive browser panel: a live, drivable CDP-screencast viewport ─────
+# A <canvas> fed JPEG frames over the gated WS (browser_stream bridges CDP screencast),
+# with mouse/keyboard/scroll forwarded back as Input.dispatch*. Chrome is the protoLabs
+# design system (plugin-kit CSS + .pl-* components); the viewport canvas itself is a
+# bespoke domain surface (theme the frame around it, not the pixels).
+_INTERACTIVE_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Browser</title>
 <link id="dskit" rel="stylesheet" href="">
 <script>
-const BASE=location.pathname.split("/plugins/")[0];
-document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
-const PORT=__DASH_PORT__;
-const LOOPBACK=["localhost","127.0.0.1","[::1]","::1"].indexOf(location.hostname)>=0;
-const LOCAL=BASE==="" && LOOPBACK;            // host view (not fleet-proxied) + browser on the box
-const MIXED=location.protocol==="https:";     // dashboard is http; an https page can't embed it
-const DASH_URL="http://"+location.hostname+":"+PORT+"/";
-</script>
-<style>
-  html,body{margin:0;height:100%;background:var(--pl-color-bg);color:var(--pl-color-fg);
-    font-family:var(--pl-font-sans);font-size:13px}
-  .bar{height:34px;display:flex;align-items:center;gap:8px;padding:0 12px;
-    border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
-  .bar b{color:var(--pl-color-accent)}
-  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
-  .dot.ok{background:#22c55e}.dot.off{background:var(--pl-color-fg-muted,#9aa0aa)}
-  .stage{height:calc(100% - 34px);position:relative;background:var(--pl-color-bg-inset)}
-  iframe{display:none;width:100%;height:100%;border:0;background:var(--pl-color-bg)}
-  #msg{display:none;position:absolute;inset:0;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}
-  .card{max-width:460px;text-align:center}
-  .card .t{font-size:15px;font-weight:600;margin-bottom:8px}
-  .card .d{color:var(--pl-color-fg-muted);line-height:1.6}
-  .card code{background:var(--pl-color-bg-subtle,rgba(127,127,127,.16));padding:.1em .35em;border-radius:4px}
-</style></head><body>
-  <div class="bar"><b>Browser</b><span id="dash" title="agent-browser dashboard"></span>
-    <span style="flex:1"></span>
-    <a id="openlink" class="pl-btn pl-btn--ghost pl-btn--sm" target="_blank" rel="noopener"
-       title="Open the dashboard in a new tab" style="display:none">Open ↗</a></div>
-  <div class="stage">
-    <iframe id="f" referrerpolicy="no-referrer" allow="clipboard-read; clipboard-write"></iframe>
-    <div id="msg"><div class="card"><div class="t" id="mt"></div><div class="d" id="md"></div></div></div>
-  </div>
-<script type="module">
-const $=(id)=>document.getElementById(id);
-let kit;
-try { kit = await import(BASE + "/_ds/plugin-kit.js"); kit.initPluginView(); }
-catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
-
-// Open-in-new-tab — show it whenever the dashboard is on THIS machine (loopback host, not
-// fleet-proxied), so you can pop the embedded dashboard out into a full tab. A top-level
-// new-tab nav reaches the http dashboard even from an https console (unlike the embed).
-if(LOCAL){ const o=$("openlink"); o.href=DASH_URL; o.style.display=""; }
-
-function showFrame(){ $("f").src=DASH_URL; $("f").style.display="block"; $("msg").style.display="none"; }
-function showMsg(title, html){ $("mt").textContent=title; $("md").innerHTML=html;
-  $("msg").style.display="flex"; $("f").style.display="none"; }
-
-function renderDash(state){
-  const el=$("dash");
-  if(!LOCAL || MIXED || state==null){ el.innerHTML=""; return; }   // control only matters when embeddable
-  el.innerHTML = state
-    ? '<span class="dot ok"></span> running <button class="pl-btn pl-btn--ghost pl-btn--sm" onclick="dashAct(\'stop\')">Stop</button>'
-    : '<span class="dot off"></span> stopped <button class="pl-btn pl-btn--sm" onclick="dashAct(\'start\')">Start dashboard</button>';
-}
-async function dashRunning(){
-  try{ const r=await kit.apiFetch("/api/plugins/agent_browser/dashboard"); return !!(await r.json()).running; }
-  catch(_){ return null; }
-}
-async function decide(){
-  if(!LOCAL){
-    renderDash(null);
-    showMsg("Open the console locally to see the dashboard",
-      "The dashboard embeds agent-browser's <b>local</b> dashboard — it only loads on the same machine that runs it. "
-      + (BASE ? "This panel is served through the fleet proxy" : "You're reaching the console at <code>"+location.hostname+"</code>")
-      + ", so its <code>localhost:"+PORT+"</code> dashboard isn't reachable from your browser.<br><br>"
-      + "Open the console at <code>http://localhost</code> on the host, or set <code>panel_mode: minimal</code> "
-      + "for a screenshot viewport that works remotely.");
-    return;
-  }
-  if(MIXED){
-    renderDash(null);
-    showMsg("Can't embed the dashboard over https",
-      "The console is served over https, but agent-browser's dashboard is http — browsers block that mix "
-      + "for an embedded frame. Use <b>Open ↗</b> above to view it in a new tab, set "
-      + "<code>panel_mode: minimal</code>, or open the console at <code>http://localhost</code>.");
-    return;
-  }
-  const running = await dashRunning(); renderDash(running);
-  if(running){ showFrame(); }
-  else { showMsg("Dashboard not running",
-    "Click <b>Start dashboard</b> in the top bar to launch it and view it here "
-    + "(or run <code>agent-browser dashboard start</code>)."); }
-}
-async function dashAct(action){
-  $("dash").innerHTML='<span class="dot off"></span> …';
-  try{ await kit.apiFetch("/api/plugins/agent_browser/dashboard",{method:"POST",
-    headers:{"Content-Type":"application/json"},body:JSON.stringify({action})}); }catch(_){}
-  setTimeout(decide, action==="start"?1500:700);
-}
-window.dashAct=dashAct;
-decide();
-// While local + not yet embedded, re-check so a dashboard started elsewhere appears on its own.
-setInterval(()=>{ if(LOCAL && !MIXED && $("f").style.display==="none") decide(); }, 6000);
-</script></body></html>"""
-
-
-# ── minimal mode: viewport-only (screenshot-poll + nav toolbar) ────────────────
-# Chrome is the protoLabs design system: plugin-kit CSS + .pl-* components (nav as
-# .pl-btn, url as .pl-input, empty state as .pl-empty), themed live by the handshake.
-_MINIMAL_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Browser</title>
-<link id="dskit" rel="stylesheet" href="">
-<script>
-// Same-origin base: "" on the host, "/agents/<slug>" when served through the fleet
-// proxy. Prefix EVERY fetch / asset with it — never hardcode an absolute path.
+// Same-origin base: "" on the host, "/agents/<slug>" through the fleet proxy. Prefix
+// EVERY fetch / asset with it (the kit does this for us via apiUrl/apiFetch).
 const BASE=location.pathname.split("/plugins/")[0];
 document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
 </script>
@@ -263,13 +148,19 @@ document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
   .bar{height:38px;display:flex;align-items:center;gap:6px;padding:0 10px;
     border-bottom:var(--pl-border-width) solid var(--pl-color-border)}
   .bar .pl-input{flex:1;min-width:0}
-  .stage{height:calc(100% - 38px);display:flex;align-items:flex-start;justify-content:center;
-    overflow:auto;background:var(--pl-color-bg-inset)}
-  img{max-width:100%;display:block}
-  .stage .pl-empty{margin:auto}
-  .dash{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--pl-color-fg-muted);margin-left:4px}
-  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
-  .dot.ok{background:#22c55e}.dot.off{background:var(--pl-color-fg-muted,#9aa0aa)}
+  .conn{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--pl-color-fg-muted);white-space:nowrap}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none;
+    background:var(--pl-color-fg-muted,#9aa0aa)}
+  .dot.ok{background:#22c55e}.dot.err{background:#ef4444}
+  .stage{height:calc(100% - 38px);position:relative;background:var(--pl-color-bg-inset);
+    display:flex;align-items:flex-start;justify-content:center;overflow:auto}
+  canvas{max-width:100%;display:block;outline:none;touch-action:none}
+  #msg{display:none;position:absolute;inset:0;align-items:center;justify-content:center;
+    padding:24px;box-sizing:border-box}
+  .card{max-width:460px;text-align:center}
+  .card .t{font-size:15px;font-weight:600;margin-bottom:8px}
+  .card .d{color:var(--pl-color-fg-muted);line-height:1.6}
+  .card code{background:var(--pl-color-bg-subtle,rgba(127,127,127,.16));padding:.1em .35em;border-radius:4px}
 </style></head><body>
   <div class="bar">
     <button class="pl-btn pl-btn--ghost pl-btn--icon pl-btn--sm" title="Back" onclick="nav('back')">◀</button>
@@ -277,78 +168,99 @@ document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
     <button class="pl-btn pl-btn--ghost pl-btn--icon pl-btn--sm" title="Reload" onclick="nav('reload')">⟳</button>
     <input id="url" class="pl-input" placeholder="example.com — Enter to open" autocomplete="off">
     <button class="pl-btn pl-btn--primary pl-btn--sm" onclick="go()">Go</button>
-    <span id="dash" class="dash" title="agent-browser dashboard"></span>
+    <span class="conn"><span id="dot" class="dot"></span><span id="cs">connecting…</span></span>
   </div>
-  <div class="stage"><img id="screen" alt="">
-    <div id="hint" class="pl-empty pl-empty--slotted">
-      <div class="pl-empty__title">No page loaded</div>
-      <div class="pl-empty__desc">Open a URL above, or let the agent drive — <code>browser_open</code>.</div>
-    </div>
+  <div class="stage">
+    <canvas id="cv" width="1280" height="800" tabindex="0"></canvas>
+    <div id="msg"><div class="card"><div class="t" id="mt"></div><div class="d" id="md"></div></div></div>
   </div>
 <script type="module">
-// The DS plugin-kit owns the protoagent:init handshake (bearer + theme, incl. live
-// re-themes onto the --pl-* tokens) and slug-aware authed fetches — replacing the
-// hand-rolled TMAP/listener this page carried. plugin-kit.js is an ES MODULE, so it
-// loads via dynamic import (a classic <script src> throws on its exports; see
-// protoAgent docs/how-to/build-a-plugin-view.md). Older host without /_ds: fall
-// back to a tokenless same-origin shim.
+const BASE=location.pathname.split("/plugins/")[0];
 let kit;
 try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
-catch (e) { kit = { initPluginView(){}, apiFetch: (p, i) => fetch(BASE + p, i) }; }
+catch (e) { kit = { initPluginView(cb){ if(cb) cb(); }, apiFetch:(p,i)=>fetch(BASE+p,i), apiUrl:(p)=>BASE+p }; }
 const $=(id)=>document.getElementById(id);
-$("url").addEventListener("keydown",(e)=>{if(e.key==="Enter")go()});
+const cv=$("cv"), ctx=cv.getContext("2d");
 
+// ── nav toolbar — reuses the gated HTTP /nav route (agent-browser open/back/…) ──
 async function nav(action,url){
   try{ await kit.apiFetch("/api/plugins/agent_browser/nav",{method:"POST",
-    headers:{"Content-Type":"application/json"},body:JSON.stringify({action,url})});
-  }catch(_){}
-  setTimeout(refresh,400);
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({action,url})}); }catch(_){}
+  if(!connected) connect();   // a just-created session now has a page to stream
 }
 function go(){ let u=$("url").value.trim(); if(!u)return; if(!/^https?:\/\//.test(u))u="https://"+u; nav("open",u); }
-// Module scripts are scoped — expose the toolbar's inline onclick handlers.
 window.nav=nav; window.go=go;
+$("url").addEventListener("keydown",(e)=>{ if(e.key==="Enter") go(); });
 
-let busy=false;
-async function refresh(){
-  if(busy)return; busy=true;
+function setStatus(s,label){ $("dot").className="dot"+(s?(" "+s):""); $("cs").textContent=label; }
+function showMsg(t,html){ $("mt").textContent=t; $("md").innerHTML=html||""; $("msg").style.display="flex"; }
+function hideMsg(){ $("msg").style.display="none"; }
+
+// ── the interactive stream: mint a ticket (gated) → open the WS → paint frames ──
+let ws=null, connected=false, devW=1280, devH=800, retry=null;
+function wsUrl(ticket){
+  const u=new URL(kit.apiUrl("/api/plugins/agent_browser/stream"), location.href);
+  u.protocol = u.protocol==="https:" ? "wss:" : "ws:";      // http→ws, https→wss
+  u.searchParams.set("ticket", ticket);
+  return u.toString();
+}
+async function connect(){
+  clearTimeout(retry);
   try{
-    const r=await kit.apiFetch("/api/plugins/agent_browser/shot?t="+Date.now());
-    if(r.ok){ const b=await r.blob(); const u=URL.createObjectURL(b);
-      const img=$("screen"); const old=img.src; img.src=u; $("hint").style.display="none";
-      if(old&&old.startsWith("blob:"))URL.revokeObjectURL(old); }
+    const r=await kit.apiFetch("/api/plugins/agent_browser/stream-ticket",{method:"POST"});
+    const ticket=(await r.json()).ticket;
+    ws=new WebSocket(wsUrl(ticket));
+    ws.binaryType="arraybuffer";
+    ws.onopen=()=>{ connected=true; setStatus("ok","live"); };
+    ws.onmessage=onMsg;
+    ws.onclose=()=>{ connected=false; setStatus("err","offline"); scheduleRetry(); };
+    ws.onerror=()=>{ try{ ws.close(); }catch(_){} };
+  }catch(_){ setStatus("err","offline"); scheduleRetry(); }
+}
+function scheduleRetry(){ clearTimeout(retry); retry=setTimeout(connect,2500); }
+async function onMsg(ev){
+  if(typeof ev.data==="string"){
+    let m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
+    if(m.t==="meta"){ if(m.w) devW=m.w; if(m.h) devH=m.h; }
+    else if(m.t==="error"){ setStatus("err","no page");
+      showMsg("Nothing to show yet",(m.msg||"")+"<br><br>Type a URL above, or let the agent drive — <code>browser_open</code>."); }
+    return;
+  }
+  try{                                   // binary → a JPEG screencast frame
+    const bmp=await createImageBitmap(new Blob([ev.data]));
+    if(cv.width!==bmp.width||cv.height!==bmp.height){ cv.width=bmp.width; cv.height=bmp.height; }
+    ctx.drawImage(bmp,0,0); bmp.close(); hideMsg(); setStatus("ok","live");
   }catch(_){}
-  busy=false;
 }
-// Dashboard control — start/stop the agent-browser dashboard daemon from the UI (no
-// terminal), show its status, and link out to it. The rich dashboard can't be EMBEDDED
-// through our sub-path proxy (its Next.js assets are root-absolute), so "Dashboard ↗"
-// opens it at its own origin in a new tab — which works on a local/host setup.
-var dashPort=__DASH_PORT__;
-function dashOpenUrl(){ return "http://"+location.hostname+":"+dashPort+"/"; }
-async function dashStatus(){
-  try{ var r=await kit.apiFetch("/api/plugins/agent_browser/dashboard"); var d=await r.json();
-    dashPort=d.port||dashPort; renderDash(!!d.running); }catch(_){ renderDash(null); }
-}
-function renderDash(running){
-  var el=$("dash"); if(running===null){ el.innerHTML=""; return; }
-  var open='<a class="pl-btn pl-btn--ghost pl-btn--sm" href="'+dashOpenUrl()+'" target="_blank" rel="noopener" title="Open the full dashboard (viewport + activity/console/network feeds) in a new tab">Dashboard ↗</a>';
-  el.innerHTML = running
-    ? '<span class="dot ok"></span>'+open+'<button class="pl-btn pl-btn--ghost pl-btn--sm" onclick="dashAct(\'stop\')" title="Stop the dashboard daemon">Stop</button>'
-    : '<span class="dot off"></span><button class="pl-btn pl-btn--sm" onclick="dashAct(\'start\')" title="Start the agent-browser dashboard daemon">Start dashboard</button>';
-}
-async function dashAct(action){
-  var el=$("dash"); el.innerHTML='<span class="dot off"></span>…';
-  try{ await kit.apiFetch("/api/plugins/agent_browser/dashboard",{method:"POST",
-    headers:{"Content-Type":"application/json"},body:JSON.stringify({action})}); }catch(_){}
-  setTimeout(dashStatus,800);
-}
-window.dashAct=dashAct;
 
-// Boot ONCE, on whichever fires first: the handshake (the bearer arrives with
-// protoagent:init, so the gated shot/nav calls authenticate) or a short timer
-// for the no-handshake case (standalone page / older host).
+// ── input forwarding: canvas events → CDP Input.dispatch* (coords in CSS px) ────
+function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+function mods(e){ return {shift:e.shiftKey,ctrl:e.ctrlKey,alt:e.altKey,meta:e.metaKey}; }
+function pos(e){ const r=cv.getBoundingClientRect();
+  return { x:(e.clientX-r.left)/r.width*devW, y:(e.clientY-r.top)/r.height*devH }; }
+const BTN={0:"left",1:"middle",2:"right"};
+cv.addEventListener("mousedown",(e)=>{ e.preventDefault(); cv.focus(); const p=pos(e);
+  send({t:"mouse",action:"down",x:p.x,y:p.y,button:BTN[e.button]||"left",clickCount:e.detail||1,buttons:e.buttons,...mods(e)}); });
+window.addEventListener("mouseup",(e)=>{ const p=pos(e);
+  send({t:"mouse",action:"up",x:p.x,y:p.y,button:BTN[e.button]||"left",clickCount:1,buttons:e.buttons,...mods(e)}); });
+let moveQueued=false,lastMove=null;
+cv.addEventListener("mousemove",(e)=>{ lastMove=e; if(moveQueued)return; moveQueued=true;
+  requestAnimationFrame(()=>{ moveQueued=false; if(!lastMove)return; const p=pos(lastMove);
+    send({t:"mouse",action:"move",x:p.x,y:p.y,buttons:lastMove.buttons,...mods(lastMove)}); }); });
+cv.addEventListener("contextmenu",(e)=>e.preventDefault());
+cv.addEventListener("wheel",(e)=>{ e.preventDefault(); const p=pos(e);
+  send({t:"wheel",x:p.x,y:p.y,dx:e.deltaX,dy:e.deltaY,...mods(e)}); },{passive:false});
+function printable(e){ return e.key && e.key.length===1 && !e.ctrlKey && !e.metaKey; }
+cv.addEventListener("keydown",(e)=>{ e.preventDefault();
+  send({t:"key",action:"down",key:e.key,code:e.code,keyCode:e.keyCode,text:printable(e)?e.key:"",...mods(e)}); });
+cv.addEventListener("keyup",(e)=>{ e.preventDefault();
+  send({t:"key",action:"up",key:e.key,code:e.code,keyCode:e.keyCode,...mods(e)}); });
+
+// ── boot ONCE — on the handshake (so apiFetch has the bearer for the gated ticket)
+// or an 800ms fallback for a standalone/older host that posts no init. ──────────
 let booted=false;
-function boot(){ if(booted)return; booted=true; refresh(); setInterval(refresh,1200); dashStatus(); setInterval(dashStatus,6000); }
+function boot(){ if(booted)return; booted=true; connect(); }
+setStatus("", "connecting…");
 kit.initPluginView(boot);
 setTimeout(boot, 800);
 </script></body></html>"""
