@@ -15,6 +15,7 @@ when proxied) so the page is same-origin + slug-aware (the token/theme handshake
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 
@@ -29,11 +30,18 @@ log = logging.getLogger("protoagent.plugins.agent_browser")
 
 
 def build_panel_router(cfg: dict | None):
+    cfg = cfg or {}
+    home = str(cfg.get("home_url") or "").strip()
     router = APIRouter()
+
+    # A safe JS string literal for `const HOME=__HOME_URL__;`. json.dumps handles quote/
+    # backslash escaping; the `<` → < step stops a `</script>` in the value from
+    # closing the inline script tag in the HTML parser (still the same string in JS).
+    home_literal = json.dumps(home).replace("<", "\\u003c")
 
     @router.get("/panel")
     async def _panel():
-        return HTMLResponse(_INTERACTIVE_PAGE)
+        return HTMLResponse(_INTERACTIVE_PAGE.replace("__HOME_URL__", home_literal))
 
     return router
 
@@ -181,6 +189,7 @@ try { kit = await import(BASE + "/_ds/plugin-kit.js"); }
 catch (e) { kit = { initPluginView(cb){ if(cb) cb(); }, apiFetch:(p,i)=>fetch(BASE+p,i), apiUrl:(p)=>BASE+p }; }
 const $=(id)=>document.getElementById(id);
 const cv=$("cv"), ctx=cv.getContext("2d");
+const HOME=__HOME_URL__;   // configured homepage (blank ⇒ Start opens about:blank, no auto-open)
 
 // ── nav toolbar — reuses the gated HTTP /nav route (agent-browser open/back/…) ──
 async function nav(action,url){
@@ -195,6 +204,20 @@ $("url").addEventListener("keydown",(e)=>{ if(e.key==="Enter") go(); });
 function setStatus(s,label){ $("dot").className="dot"+(s?(" "+s):""); $("cs").textContent=label; }
 function showMsg(t,html){ $("mt").textContent=t; $("md").innerHTML=html||""; $("msg").style.display="flex"; }
 function hideMsg(){ $("msg").style.display="none"; }
+
+// ── the empty state: a Start button (+ a one-shot auto-open of the homepage) ───
+let autoStarted=false;
+function homeHost(){ try{ return new URL(HOME).host || HOME; }catch(_){ return HOME; } }
+function startBrowser(){ nav("open", HOME || "about:blank"); }
+window.startBrowser=startBrowser;
+function showStart(note){
+  const label = HOME ? ("Open " + homeHost()) : "Start browser";
+  showMsg("No page open",
+    (note ? note + "<br><br>" : "")
+    + '<button class="pl-btn pl-btn--primary pl-btn--sm" onclick="startBrowser()">' + label + '</button>'
+    + '<div style="margin-top:12px">or type a URL above, or let the agent drive — <code>browser_open</code>.</div>');
+  if(HOME && !autoStarted){ autoStarted=true; startBrowser(); }   // open the configured homepage once
+}
 
 // ── the interactive stream: mint a ticket (gated) → open the WS → paint frames ──
 let ws=null, connected=false, devW=1280, devH=800, retry=null;
@@ -222,8 +245,7 @@ async function onMsg(ev){
   if(typeof ev.data==="string"){
     let m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
     if(m.t==="meta"){ if(m.w) devW=m.w; if(m.h) devH=m.h; }
-    else if(m.t==="error"){ setStatus("err","no page");
-      showMsg("Nothing to show yet",(m.msg||"")+"<br><br>Type a URL above, or let the agent drive — <code>browser_open</code>."); }
+    else if(m.t==="error"){ setStatus("err","no page"); showStart(m.msg); }
     return;
   }
   try{                                   // binary → a JPEG screencast frame

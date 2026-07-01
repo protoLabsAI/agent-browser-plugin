@@ -23,6 +23,9 @@ config_section: agent_browser
 config:
   binary: agent-browser     # the agent-browser CLI on PATH (override for a pinned path)
   timeout_s: 60             # per-command subprocess timeout
+  home_url: ""              # homepage the panel opens to. When set, the panel auto-opens it if
+                            # no browser page is open; the empty state also shows a Start button.
+                            # Blank → the Start button opens about:blank (no auto-open).
   # Runtime / launch options — a curated set passed to `agent-browser open` so you can
   # shape and lock down the browser the agent spins up. Blank/0/false = CLI default.
   headed: false             # show a real browser window instead of headless
@@ -34,6 +37,7 @@ config:
 
 # Editable in Settings ▸ Plugins (ADR 0019) — the operator knobs above as UI fields.
 settings:
+  - { key: home_url, label: "Homepage URL", type: string, description: "The page the interactive panel opens to. When set, it auto-opens if no browser page is open, and the empty state shows a Start button. Blank = a Start button that opens about:blank." }
   - { key: headed, label: "Headed browser", type: bool, description: "Show a real browser window instead of running headless." }
   - { key: allowed_domains, label: "Allowed domains", type: string, description: "Comma-separated navigable-domain allowlist (e.g. example.com,*.foo.com). Blank = unrestricted." }
   - { key: confirm_actions, label: "Confirm actions", type: string, description: "Comma-separated action categories that require confirmation before the agent runs them." }

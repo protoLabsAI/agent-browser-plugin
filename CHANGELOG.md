@@ -10,6 +10,10 @@
 - **How it works.** A second CDP client attaches to the same Chrome agent-browser drives (via
   `agent-browser get cdp-url`); `browser_stream.py` bridges `Page.startScreencast` ⇆ the panel.
   The nav toolbar (url / back / forward / reload) reuses the gated HTTP `/nav` route.
+- **Start button + configurable homepage.** When no page is open, the panel shows a **Start
+  button** instead of a dead end. A new `home_url` config sets the page it opens to: when set,
+  the panel **auto-opens** it (and the button reads “Open <host>”); blank → the button opens
+  `about:blank`. Editable in Settings ▸ Plugins.
 - **WebSocket auth.** The host's operator-bearer gate is HTTP-only and does **not** cover WS
   handshakes, so the stream self-gates: the panel mints a **single-use ticket** from the gated
   `POST /stream-ticket` (bearer-checked) and presents it on the WS URL; the handler validates and

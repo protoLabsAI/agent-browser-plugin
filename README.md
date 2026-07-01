@@ -45,6 +45,9 @@ point.
   **host and a remote fleet member** alike. A second CDP client attaches to the same Chrome
   agent-browser drives (`agent-browser get cdp-url`); `browser_stream.py` does the bridging.
 
+  When no page is open the panel shows a **Start button** (not a dead end). Set `home_url` to a
+  page and the panel **auto-opens** it — a homepage — otherwise Start opens `about:blank`.
+
   **WebSocket auth:** the host's operator-bearer gate is HTTP-only and doesn't cover WS
   handshakes, so the stream self-gates — the panel mints a **single-use ticket** from the gated
   `POST /api/plugins/agent_browser/stream-ticket` and presents it on the WS URL.

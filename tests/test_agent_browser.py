@@ -159,9 +159,23 @@ def test_panel_page_wires_canvas_stream_and_input():
     assert 'u.protocol==="https:" ? "wss:" : "ws:"' in html  # http→ws upgrade
     assert 'send({t:"mouse"' in html and 'send({t:"key"' in html  # input forwarding
     assert "/api/plugins/agent_browser/nav" in html and "kit.apiFetch" in html  # nav via gated route
+    assert "startBrowser" in html and 'const HOME="";' in html  # empty-state Start; blank home default
     # the removed dashboard-embed / screenshot modes leave no trace:
     assert "/api/plugins/agent_browser/shot" not in html
     assert 'id="f"' not in html and "Open the console locally" not in html
+
+
+def test_panel_home_url_is_injected_safely():
+    from fastapi.testclient import TestClient
+
+    # a configured homepage lands as a JS string literal the Start button + auto-open use
+    html = TestClient(_app({"home_url": "https://example.com"})).get("/plugins/agent_browser/panel").text
+    assert 'const HOME="https://example.com";' in html
+    assert "__HOME_URL__" not in html  # placeholder fully interpolated
+    # a </script>-injection attempt is escaped: the quote is JSON-escaped and the `<`
+    # becomes <, so it neither breaks the JS string nor closes the inline script.
+    evil = TestClient(_app({"home_url": '"</script>'})).get("/plugins/agent_browser/panel").text
+    assert 'const HOME="\\"\\u003c/script>";' in evil
 
 
 def test_stream_ticket_route_mints_a_ticket():
