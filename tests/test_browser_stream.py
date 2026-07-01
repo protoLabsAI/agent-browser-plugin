@@ -164,3 +164,24 @@ def test_ticket_expires_after_ttl(monkeypatch):
     t = bs.mint_ticket()
     clock["t"] += bs._TICKET_TTL + 1     # advance past the TTL
     assert bs.consume_ticket(t) is False
+
+
+# ── viewport_metrics: clamp panel size → viewport + frame caps ──────────────────
+
+
+def test_viewport_metrics_normal_hidpi():
+    cw, ch, scale, mw, mh = bs.viewport_metrics(800, 1000, 2)
+    assert (cw, ch, scale) == (800, 1000, 2.0)
+    assert (mw, mh) == (1600, 2000)  # frame = css × dpr
+
+
+def test_viewport_metrics_clamps_giant_dock():
+    cw, ch, scale, mw, mh = bs.viewport_metrics(5000, 5000, 3)
+    assert (cw, ch, scale) == (2048, 2048, 2.0)  # css ≤2048, dpr ≤2
+    assert (mw, mh) == (2560, 2560)  # frame long side capped at 2560
+
+
+def test_viewport_metrics_floors_degenerate():
+    assert bs.viewport_metrics(0, 0, 0) == (1, 1, 1.0, 1, 1)
+    # sub-1 dpr floors to 1.0 (never upscale-blur by pretending lo-dpi)
+    assert bs.viewport_metrics(640, 480, 0.5)[2] == 1.0

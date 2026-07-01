@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.1
+- **Full-stretch, responsive viewport.** The panel now resizes Chrome's layout viewport to
+  your dock's size (× device-pixel-ratio) over CDP as you resize/expand/collapse it — the page
+  reflows to fill, instead of a fixed landscape box floating in dead space. The canvas fills the
+  stage; a `ResizeObserver` (debounced) keeps them in sync.
+- **The agent's navigation is now visible.** A cross-process navigation tears down Chrome's
+  screencast, so previously you saw the first page load but nothing as the agent moved around or
+  into sub-pages. The stream now **re-arms** on every navigation-complete signal (`loadEventFired`
+  / `frameStoppedLoading` / `frameNavigated` / `navigatedWithinDocument`, debounced) — every page
+  paints.
+- **Higher fidelity.** JPEG quality raised to **80** (was 60) and configurable via
+  `stream_quality`; combined with hi-dpi rendering (deviceScaleFactor up to 2×) the viewport is
+  noticeably crisper.
+- **Anti-detection (`stealth`).** New knobs to help past bot walls (Google, Reddit, Cloudflare):
+  `stealth` drops the `navigator.webdriver` automation flag and, when headless, swaps the
+  "HeadlessChrome" User-Agent for a real desktop one; plus `user_agent` and `browser_args`
+  overrides. Most reliable paired with `headed: true` + a logged-in `profile`. No setting defeats
+  detection entirely. Launch flags are now also applied when a session is started from the panel
+  (the Start button / URL bar), not just from the agent's `browser_open`.
+
 ## v0.6.0
 - **The Browser panel is now a fully interactive, drivable viewport — and it is the ONLY mode.**
   A live **CDP screencast** — event-driven JPEG frames (not a screenshot poll) painted on a

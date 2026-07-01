@@ -181,21 +181,52 @@ def resolve_page_target(binary: str, timeout: float = 10.0) -> tuple[str | None,
     return (page, "" if page else "no page target to stream (open a URL first)")
 
 
-class CDPStream:
-    """A minimal async CDP client over one page target: start a screencast, ack
-    frames, and dispatch input. `frame_cb(jpeg_bytes, metadata)` is called for each
-    `Page.screencastFrame`. Requires the ``websockets`` package (a uvicorn extra —
-    already present wherever the host serves WebSockets)."""
+def viewport_metrics(w, h, dpr) -> tuple[int, int, float, int, int]:
+    """Clamp a panel size → ``(css_w, css_h, scale, frame_max_w, frame_max_h)``. The CSS
+    size drives Chrome's layout viewport; scale (device-pixel-ratio, capped at 2) keeps
+    frames crisp on hi-dpi; the frame max caps the screencast so a huge dock can't flood
+    the socket."""
+    cw = max(1, min(int(w or 0), 2048))
+    ch = max(1, min(int(h or 0), 2048))
+    scale = max(1.0, min(float(dpr or 1), 2.0))
+    return cw, ch, scale, min(int(cw * scale), 2560), min(int(ch * scale), 2560)
 
-    def __init__(self, page_ws_url: str, frame_cb):
+
+# CDP events that mean "a new document is ready" → re-arm the screencast. The set that
+# actually fires varies by navigation kind, so we listen for all of them (debounced).
+_NAV_DONE = frozenset((
+    "Page.loadEventFired", "Page.frameStoppedLoading",
+    "Page.frameNavigated", "Page.navigatedWithinDocument",
+))
+
+
+class CDPStream:
+    """A minimal async CDP client over one page target: start a screencast, ack frames,
+    resize the viewport to the panel, and dispatch input. ``frame_cb(jpeg, metadata)``
+    fires per ``Page.screencastFrame``. Requires ``websockets`` (a uvicorn extra).
+
+    Two robustness details the naive version missed:
+    - **Re-arm on navigation.** A cross-process navigation swaps the page's render widget
+      and Chrome silently stops the screencast — so we re-issue ``startScreencast`` on each
+      top-frame ``Page.frameNavigated`` / ``Page.loadEventFired``. Without this you see the
+      first page but nothing as the agent moves around or into sub-pages.
+    - **One writer.** Frame acks + nav re-arms (reader task) and input/resize (request
+      task) both write to the socket, so a lock serializes sends."""
+
+    def __init__(self, page_ws_url: str, frame_cb, quality: int = 80):
         self._url = page_ws_url
         self._frame_cb = frame_cb
+        self._quality = max(1, min(int(quality or 80), 100))
+        self._cast = (1280, 800)      # current screencast max frame size (device px)
         self._ws = None
         self._id = 0
+        self._last_arm = 0.0          # debounce re-arms (multi-frame pages fire many events)
+        self._lock: asyncio.Lock | None = None
         self._reader: asyncio.Task | None = None
 
     async def __aenter__(self):
         import websockets
+        self._lock = asyncio.Lock()
         self._ws = await websockets.connect(self._url, max_size=None, open_timeout=10)
         self._reader = asyncio.create_task(self._read_loop())
         return self
@@ -207,16 +238,34 @@ class CDPStream:
             await self._ws.close()
 
     async def _send(self, method: str, params: dict | None = None) -> int:
-        self._id += 1
-        await self._ws.send(json.dumps({"id": self._id, "method": method, "params": params or {}}))
-        return self._id
+        async with self._lock:  # serialize writes: reader (acks/re-arm) + request task (input/resize)
+            self._id += 1
+            await self._ws.send(json.dumps({"id": self._id, "method": method, "params": params or {}}))
+            return self._id
 
-    async def start_screencast(self, max_w: int = 1280, max_h: int = 800, quality: int = 60):
-        await self._send("Page.enable")
-        await self._send("Page.startScreencast", {"format": "jpeg", "quality": quality,
-                         "maxWidth": max_w, "maxHeight": max_h, "everyNthFrame": 1})
+    async def _arm_cast(self):
+        mw, mh = self._cast
+        await self._send("Page.startScreencast", {"format": "jpeg", "quality": self._quality,
+                         "maxWidth": mw, "maxHeight": mh, "everyNthFrame": 1})
+
+    async def start_screencast(self, max_w: int = 1280, max_h: int = 800):
+        await self._send("Page.enable")   # also enables frameNavigated / loadEventFired for re-arm
+        self._cast = (max_w, max_h)
+        await self._arm_cast()
+
+    async def set_viewport(self, w, h, dpr=1.0):
+        """Resize Chrome's layout viewport to the panel and re-arm the screencast at the
+        matching frame size — so the page reflows to fill, and stays crisp."""
+        cw, ch, scale, mw, mh = viewport_metrics(w, h, dpr)
+        await self._send("Emulation.setDeviceMetricsOverride",
+                         {"width": cw, "height": ch, "deviceScaleFactor": scale, "mobile": False})
+        self._cast = (mw, mh)
+        await self._arm_cast()
 
     async def dispatch(self, msg: dict):
+        if msg.get("t") == "resize":
+            await self.set_viewport(msg.get("w"), msg.get("h"), msg.get("dpr", 1))
+            return
         cmd = input_to_cdp(msg)
         if cmd:
             await self._send(*cmd)
@@ -228,9 +277,23 @@ class CDPStream:
                 m = json.loads(raw)
             except Exception:  # noqa: BLE001
                 continue
-            if m.get("method") == "Page.screencastFrame":
+            method = m.get("method")
+            if method == "Page.screencastFrame":
                 p = m["params"]
                 try:
                     await self._frame_cb(base64.b64decode(p["data"]), p.get("metadata", {}))
                 finally:
                     await self._send("Page.screencastFrameAck", {"sessionId": p["sessionId"]})
+            elif method in _NAV_DONE:
+                # A navigation swaps the render widget and Chrome drops the screencast.
+                # These are the "new document is ready" signals — which one fires varies by
+                # navigation kind (real cross-origin nav emits loadEventFired/frameNavigated;
+                # data:/SPA emit frameStoppedLoading/navigatedWithinDocument), so we cover all
+                # and debounce, since a multi-frame page fires several.
+                now = time.monotonic()
+                if now - self._last_arm > 0.2:
+                    self._last_arm = now
+                    try:
+                        await self._arm_cast()   # bring the screencast back
+                    except Exception:  # noqa: BLE001 — transient during teardown
+                        pass

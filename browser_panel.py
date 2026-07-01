@@ -25,6 +25,7 @@ from fastapi import APIRouter, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import browser_stream
+from .runtime import launch_flags
 
 log = logging.getLogger("protoagent.plugins.agent_browser")
 
@@ -58,6 +59,7 @@ def build_panel_data_router(cfg: dict | None):
     cfg = cfg or {}
     binary = str(cfg.get("binary") or "agent-browser")
     timeout = float(cfg.get("timeout_s", 60))
+    quality = int(cfg.get("stream_quality", 80) or 80)
 
     router = APIRouter()
 
@@ -105,7 +107,7 @@ def build_panel_data_router(cfg: dict | None):
                 return
 
         try:
-            async with browser_stream.CDPStream(page_ws, on_frame) as cdp:
+            async with browser_stream.CDPStream(page_ws, on_frame, quality=quality) as cdp:
                 await cdp.start_screencast()
                 while True:
                     await cdp.dispatch(await ws.receive_json())
@@ -126,7 +128,9 @@ def build_panel_data_router(cfg: dict | None):
         if action == "open":
             if not url:
                 return JSONResponse({"ok": False, "error": "url required"})
-            rc, err = await asyncio.to_thread(lambda: _run("open", url))
+            # launch flags (headed/profile/stealth/…) so a session started from the panel
+            # matches one the agent opens.
+            rc, err = await asyncio.to_thread(lambda: _run(*launch_flags(cfg), "open", url))
         elif action in ("back", "forward", "reload"):
             rc, err = await asyncio.to_thread(lambda: _run(action))
         else:
@@ -160,9 +164,8 @@ document.getElementById("dskit").href=BASE+"/_ds/plugin-kit.css";
   .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none;
     background:var(--pl-color-fg-muted,#9aa0aa)}
   .dot.ok{background:#22c55e}.dot.err{background:#ef4444}
-  .stage{height:calc(100% - 38px);position:relative;background:var(--pl-color-bg-inset);
-    display:flex;align-items:flex-start;justify-content:center;overflow:auto}
-  canvas{max-width:100%;display:block;outline:none;touch-action:none}
+  .stage{height:calc(100% - 38px);position:relative;background:var(--pl-color-bg-inset);overflow:hidden}
+  canvas{width:100%;height:100%;display:block;outline:none;touch-action:none}
   #msg{display:none;position:absolute;inset:0;align-items:center;justify-content:center;
     padding:24px;box-sizing:border-box}
   .card{max-width:460px;text-align:center}
@@ -234,7 +237,7 @@ async function connect(){
     const ticket=(await r.json()).ticket;
     ws=new WebSocket(wsUrl(ticket));
     ws.binaryType="arraybuffer";
-    ws.onopen=()=>{ connected=true; setStatus("ok","live"); };
+    ws.onopen=()=>{ connected=true; setStatus("ok","live"); sendResize(); };
     ws.onmessage=onMsg;
     ws.onclose=()=>{ connected=false; setStatus("err","offline"); scheduleRetry(); };
     ws.onerror=()=>{ try{ ws.close(); }catch(_){} };
@@ -277,6 +280,15 @@ cv.addEventListener("keydown",(e)=>{ e.preventDefault();
   send({t:"key",action:"down",key:e.key,code:e.code,keyCode:e.keyCode,text:printable(e)?e.key:"",...mods(e)}); });
 cv.addEventListener("keyup",(e)=>{ e.preventDefault();
   send({t:"key",action:"up",key:e.key,code:e.code,keyCode:e.keyCode,...mods(e)}); });
+
+// ── keep the browser viewport matched to the panel (full stretch + responsive) ──
+// The server resizes Chrome's layout viewport to these dims (CDP), so the page reflows
+// to fill the dock and frames come at its shape/DPI — no letterboxed "standard viewport".
+let rzTimer=null;
+function panelSize(){ const r=cv.parentElement.getBoundingClientRect();
+  return { w:Math.round(r.width), h:Math.round(r.height), dpr:Math.min(window.devicePixelRatio||1, 2) }; }
+function sendResize(){ const s=panelSize(); if(s.w>10 && s.h>10) send({t:"resize",w:s.w,h:s.h,dpr:s.dpr}); }
+new ResizeObserver(()=>{ clearTimeout(rzTimer); rzTimer=setTimeout(sendResize, 180); }).observe(cv.parentElement);
 
 // ── boot ONCE — on the handshake (so apiFetch has the bearer for the gated ticket)
 // or an 800ms fallback for a standalone/older host that posts no init. ──────────

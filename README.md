@@ -45,8 +45,19 @@ point.
   **host and a remote fleet member** alike. A second CDP client attaches to the same Chrome
   agent-browser drives (`agent-browser get cdp-url`); `browser_stream.py` does the bridging.
 
+  The viewport is **full-stretch and responsive** — it resizes Chrome's layout viewport to your
+  dock's size (× device-pixel-ratio) as you expand/collapse it, so the page reflows to fill rather
+  than sitting as a fixed box, and the screencast **re-arms on every navigation** so you see the
+  agent move through pages and sub-pages (not just the first load). Tune sharpness with
+  `stream_quality`.
+
   When no page is open the panel shows a **Start button** (not a dead end). Set `home_url` to a
   page and the panel **auto-opens** it — a homepage — otherwise Start opens `about:blank`.
+
+  **Getting past bot walls** (Google, Reddit, Cloudflare): set `stealth: true` (drops the
+  automation flag + real UA when headless), and — most reliably — `headed: true` with a logged-in
+  Chrome `profile`. `user_agent` / `browser_args` are there for fine control. No setting defeats
+  detection entirely.
 
   **WebSocket auth:** the host's operator-bearer gate is HTTP-only and doesn't cover WS
   handshakes, so the stream self-gates — the panel mints a **single-use ticket** from the gated
@@ -82,7 +93,8 @@ agent_browser:
 |---|---|
 | `tools.py` | the browser tools — subprocess wrappers over the `agent-browser` CLI |
 | `browser_panel.py` | the Browser panel page + routes — the interactive canvas + the gated nav / stream-ticket / WS-stream routes |
-| `browser_stream.py` | the CDP bridge — screencast frames out, input in; the WS ticket auth |
+| `browser_stream.py` | the CDP bridge — screencast frames out, input in, viewport resize + nav re-arm; the WS ticket auth |
+| `runtime.py` | shared launch-flag builder (headed / profile / device / stealth), used by the tools and the panel |
 | `skills/` | the discovery skill (defers to `agent-browser skills get core`) |
 | `workflows/` | declarative browser recipes |
 | `tests/` | the host-free pytest suite (subprocess mocked — no binary needed) |
