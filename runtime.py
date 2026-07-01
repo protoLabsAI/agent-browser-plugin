@@ -23,8 +23,18 @@ def launch_flags(cfg: dict | None) -> list[str]:
     cfg = cfg or {}
     f: list[str] = []
     headed = bool(cfg.get("headed"))
+    # Extra Chrome launch args (comma/newline separated); anti-detection + anti-throttle
+    # flags get merged in below.
+    args = [a.strip() for a in str(cfg.get("browser_args") or "").replace("\n", ",").split(",") if a.strip()]
     if headed:
         f.append("--headed")
+        # A headed window gets throttled/paused when it loses focus or is occluded, which
+        # stalls the live screencast. Keep it rendering so the panel updates even when the
+        # operator is looking at another window.
+        for a in ("--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+                  "--disable-background-timer-throttling"):
+            if a not in args:
+                args.append(a)
     if str(cfg.get("profile") or "").strip():
         f += ["--profile", str(cfg["profile"]).strip()]
     if str(cfg.get("device") or "").strip():
@@ -37,10 +47,8 @@ def launch_flags(cfg: dict | None) -> list[str]:
         f += ["--max-output", str(int(cfg["max_output"]))]
 
     # ── anti-detection ──────────────────────────────────────────────────────────
-    # Extra Chrome launch args (comma/newline separated) + a UA override. `stealth` layers
-    # on the common evasions: drop the `navigator.webdriver` automation flag, and (when
-    # headless, where the UA says "HeadlessChrome") swap in a real desktop UA.
-    args = [a.strip() for a in str(cfg.get("browser_args") or "").replace("\n", ",").split(",") if a.strip()]
+    # `stealth` layers on the common evasions: drop the `navigator.webdriver` automation
+    # flag, and (when headless, where the UA says "HeadlessChrome") swap in a real desktop UA.
     ua = str(cfg.get("user_agent") or "").strip()
     if bool(cfg.get("stealth")):
         if "--disable-blink-features=AutomationControlled" not in args:

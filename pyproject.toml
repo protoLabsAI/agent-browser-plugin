@@ -1,6 +1,6 @@
 [project]
 name = "agent-browser-plugin"
-version = "0.6.1"
+version = "0.6.2"
 description = "Browser-automation plugin for protoAgent, backed by vercel-labs/agent-browser (tools + skill + workflows + an interactive, drivable browser panel)."
 requires-python = ">=3.11"
 
