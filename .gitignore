@@ -7,3 +7,7 @@ __pycache__/
 .worktrees/
 .pytest_cache/
 .DS_Store
+# Agent scratch (per-session, not versioned)
+.proto/memory/
+.proto/session-notes.md
+.proto/repo-map-cache.json
