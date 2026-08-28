@@ -5,6 +5,8 @@ mocked, so no agent-browser binary and no real browser are needed."""
 
 from __future__ import annotations
 
+import io
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -20,12 +22,64 @@ def _toolmap(cfg=None):
     return {t.name: t for t in tools.get_browser_tools(cfg or {})}
 
 
+# ── a subprocess.Popen stand-in for the tool wrappers ────────────────────────────
+# _run() now streams the child's pipes through drain threads under a byte cap, so the
+# tool tests mock Popen (not run): BytesIO pipes yield the canned bytes, wait()/kill()
+# drive the timeout + reap paths.
+
+
+class _FakeProc:
+    """Minimal Popen: BytesIO pipes + wait/kill, enough for _run's drain loop."""
+
+    def __init__(self, argv, out=b"", err=b"", rc=0, timeout=False):
+        self._argv = list(argv)
+        self.stdout = io.BytesIO(out)
+        self.stderr = io.BytesIO(err)
+        self._rc = rc
+        self._timeout = timeout  # make wait(timeout=…) raise until killed
+        self.returncode = None
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if self._timeout and timeout is not None and not self.killed:
+            raise subprocess.TimeoutExpired(cmd=self._argv[0], timeout=timeout)
+        if self.returncode is None:
+            self.returncode = -9 if self.killed else self._rc
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def poll(self):
+        return self.returncode
+
+
+def fake_popen(out=b"", err=b"", rc=0, timeout=False, record=None, procs=None):
+    """A subprocess.Popen stand-in: records argv, returns a _FakeProc whose pipes yield
+    the canned bytes. Swallows the stdout=/stderr= PIPE kwargs the wrapper passes."""
+    if isinstance(out, str):
+        out = out.encode()
+    if isinstance(err, str):
+        err = err.encode()
+
+    def _popen(argv, **kw):
+        if record is not None:
+            record.append(list(argv))
+        p = _FakeProc(argv, out=out, err=err, rc=rc, timeout=timeout)
+        if procs is not None:
+            procs.append(p)
+        return p
+
+    return _popen
+
+
 # ── the tools: arg-building ──────────────────────────────────────────────────────
 
 
 async def test_open_passes_url_and_curated_launch_flags(monkeypatch):
     rec = []
-    monkeypatch.setattr(tools.subprocess, "run", fake_run(stdout="OPENED", record=rec))
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(out="OPENED", record=rec))
     # headless so argv is clean (headed injects anti-throttle --args; covered in test_runtime)
     t = _toolmap({"binary": "ab", "allowed_domains": "x.com", "max_output": 500})
     out = await t["browser_open"].ainvoke({"url": "https://x.com"})
@@ -35,14 +89,14 @@ async def test_open_passes_url_and_curated_launch_flags(monkeypatch):
 
 async def test_open_blank_url_omits_it(monkeypatch):
     rec = []
-    monkeypatch.setattr(tools.subprocess, "run", fake_run(record=rec))
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(record=rec))
     await _toolmap({"binary": "ab"})["browser_open"].ainvoke({})
     assert rec[-1] == ["ab", "open"]
 
 
 async def test_action_tools_pass_refs(monkeypatch):
     rec = []
-    monkeypatch.setattr(tools.subprocess, "run", fake_run(record=rec))
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(record=rec))
     t = _toolmap({"binary": "ab"})
     await t["browser_click"].ainvoke({"selector": "@e2"})
     assert rec[-1] == ["ab", "click", "@e2"]
@@ -71,27 +125,74 @@ def test_all_16_tools_present():
 
 
 async def test_missing_binary_returns_install_hint(monkeypatch):
-    def boom(args, **kw):
+    def boom(argv, **kw):
         raise FileNotFoundError()
 
-    monkeypatch.setattr(tools.subprocess, "run", boom)
+    monkeypatch.setattr(tools.subprocess, "Popen", boom)
     out = await _toolmap({"binary": "nope"})["browser_snapshot"].ainvoke({})
     assert "not on PATH" in out and "npm i -g agent-browser" in out
 
 
-async def test_timeout_returns_readable_error(monkeypatch):
-    def slow(args, **kw):
-        raise tools.subprocess.TimeoutExpired(cmd="ab", timeout=1)
-
-    monkeypatch.setattr(tools.subprocess, "run", slow)
+async def test_timeout_returns_readable_error_and_reaps_child(monkeypatch):
+    procs = []
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(timeout=True, procs=procs))
     out = await _toolmap({"binary": "ab", "timeout_s": 1})["browser_snapshot"].ainvoke({})
     assert "timed out" in out
+    assert procs[0].killed  # child terminated + reaped on timeout — never a zombie
 
 
 async def test_nonzero_exit_surfaces_stderr(monkeypatch):
-    monkeypatch.setattr(tools.subprocess, "run", fake_run(rc=2, stderr="boom"))
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(rc=2, err="boom"))
     out = await _toolmap({"binary": "ab"})["browser_click"].ainvoke({"selector": "@e9"})
     assert out.startswith("Error:") and "boom" in out
+
+
+# ── the tools: aggregate stdout+stderr byte cap (memory + context safety) ──────────
+
+
+async def test_output_within_cap_is_unchanged(monkeypatch):
+    # under the cap → behavior identical to before: raw stdout, stripped.
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(out="hello world\n"))
+    out = await _toolmap({"binary": "ab", "max_response_bytes": 100})["browser_get_text"].ainvoke({"selector": "body"})
+    assert out == "hello world"
+
+
+async def test_output_over_cap_is_truncated_with_diagnostic(monkeypatch):
+    procs = []
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(out=b"x" * 5000, procs=procs))
+    t = _toolmap({"binary": "ab", "max_response_bytes": 100})
+    out = await t["browser_get_text"].ainvoke({"selector": "body"})
+    assert out == "Error: output exceeded 100 bytes (truncated)"
+    assert procs[0].killed  # overflow kills the child cleanly
+
+
+async def test_aggregate_stdout_plus_stderr_is_bounded(monkeypatch):
+    # neither stream alone exceeds the cap, but together they do → still bounded.
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(out=b"a" * 60, err=b"b" * 60))
+    out = await _toolmap({"binary": "ab", "max_response_bytes": 100})["browser_snapshot"].ainvoke({})
+    assert out == "Error: output exceeded 100 bytes (truncated)"
+
+
+async def test_configured_cap_overrides_default(monkeypatch):
+    # a small configured cap trips where the 200KB default would not.
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(out=b"y" * 1000))
+    out = await _toolmap({"binary": "ab", "max_response_bytes": 10})["browser_get_html"].ainvoke({})
+    assert out == "Error: output exceeded 10 bytes (truncated)"
+
+
+async def test_default_cap_is_200kb_when_unconfigured(monkeypatch):
+    # no max_response_bytes key → 200000 default applies; 250KB overflows, and the
+    # diagnostic names the default limit.
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(out=b"z" * 250_000))
+    out = await _toolmap({"binary": "ab"})["browser_get_text"].ainvoke({"selector": "body"})
+    assert out == "Error: output exceeded 200000 bytes (truncated)"
+
+
+async def test_output_at_the_cap_is_not_truncated(monkeypatch):
+    # exactly the cap is allowed through (only strictly-larger output overflows).
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen(out=b"q" * 50))
+    out = await _toolmap({"binary": "ab", "max_response_bytes": 50})["browser_get_text"].ainvoke({"selector": "body"})
+    assert out == "q" * 50
 
 
 # ── register() wiring ────────────────────────────────────────────────────────────
@@ -134,6 +235,15 @@ def test_settings_fields_are_valid_and_back_real_config():
     assert "panel_mode" not in m["config"] and "manage_dashboard" not in m["config"]
     # every settings key has a declared default in config:
     assert set(by_key) <= set(m["config"])
+
+
+def test_max_response_bytes_default_is_declared():
+    import yaml
+
+    m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
+    assert m["config"]["max_response_bytes"] == 200000  # the wrapper's default cap
+    by_key = {f["key"]: f for f in m["settings"]}
+    assert by_key["max_response_bytes"]["type"] == "number"  # operator-editable knob
 
 
 # ── the panel routes (page / ticket / WS gating / nav) ───────────────────────────
