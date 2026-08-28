@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import threading
 
 from langchain_core.tools import tool
 
@@ -22,24 +23,89 @@ from .runtime import launch_flags
 
 log = logging.getLogger("protoagent.plugins.agent_browser")
 
+# Default aggregate stdout+stderr byte cap when `max_response_bytes` is unset.
+_DEFAULT_MAX_RESPONSE_BYTES = 200_000
+_READ_CHUNK = 65_536
+
 
 def get_browser_tools(cfg: dict | None):
     cfg = cfg or {}
     binary = str(cfg.get("binary") or "agent-browser")
     timeout = float(cfg.get("timeout_s", 60))
+    # Plugin-owned cap on the total bytes a single invocation may buffer. Untrusted page
+    # content (get text/html, eval) can emit unbounded output that would otherwise pile up
+    # in memory and flood the model's context window, so we read the pipes incrementally
+    # and stop the child the moment the aggregate crosses the cap.
+    max_bytes = int(cfg.get("max_response_bytes", _DEFAULT_MAX_RESPONSE_BYTES) or _DEFAULT_MAX_RESPONSE_BYTES)
 
     def _run(*args: str) -> str:
-        """Run `agent-browser <args>` and return stdout, or a readable error."""
+        """Run `agent-browser <args>` and return stdout, or a readable error.
+
+        Uses Popen with one drain thread per pipe (concurrent, so a full stderr can't
+        deadlock stdout) enforcing an aggregate byte cap owned here. On overflow the child
+        is killed and a bounded diagnostic is returned; on timeout the child is terminated.
+        Either way the child is reaped — no zombies.
+        """
         try:
-            proc = subprocess.run([binary, *args], capture_output=True, text=True, timeout=timeout)
+            proc = subprocess.Popen([binary, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except FileNotFoundError:
             return (f"Error: {binary!r} not on PATH — install it: "
                     "`npm i -g agent-browser && agent-browser install`")
+
+        out_buf, err_buf = bytearray(), bytearray()
+        total = 0
+        overflow = False
+        lock = threading.Lock()
+
+        def _drain(pipe, buf: bytearray) -> None:
+            nonlocal total, overflow
+            hit = False
+            try:
+                for block in iter(lambda: pipe.read(_READ_CHUNK), b""):
+                    with lock:
+                        if overflow:
+                            break
+                        total += len(block)
+                        if total > max_bytes:  # aggregate crossed the cap → stop + kill
+                            overflow = True
+                            hit = True
+                            break
+                        buf.extend(block)
+            except (OSError, ValueError):
+                pass  # pipe closed under us (e.g. after kill) — nothing more to read
+            finally:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+            if hit:
+                proc.kill()  # unblock the sibling reader and let wait() return
+
+        drains = [threading.Thread(target=_drain, args=(proc.stdout, out_buf), daemon=True),
+                  threading.Thread(target=_drain, args=(proc.stderr, err_buf), daemon=True)]
+        for t in drains:
+            t.start()
+
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()  # terminate …
+            try:
+                proc.wait(timeout=5)  # … and reap, so we never leave a zombie
+            except subprocess.TimeoutExpired:
+                pass
+        for t in drains:
+            t.join()
+
+        if timed_out:
             return f"Error: `agent-browser {' '.join(args)}` timed out after {timeout:g}s"
-        out = (proc.stdout or "").strip()
+        if overflow:
+            return f"Error: output exceeded {max_bytes} bytes (truncated)"
+        out = out_buf.decode("utf-8", "replace").strip()
         if proc.returncode != 0:
-            err = (proc.stderr or out or "").strip()
+            err = (err_buf.decode("utf-8", "replace") or out or "").strip()
             return f"Error: `agent-browser {' '.join(args)}` failed: {err[:500]}"
         return out or "(ok)"
 

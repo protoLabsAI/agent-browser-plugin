@@ -1,6 +1,6 @@
 id: agent_browser
 name: Agent Browser
-version: 0.6.4
+version: 0.6.5
 description: >-
   Browser automation for protoAgent, backed by **agent-browser** (vercel-labs) — a
   fast native-Rust CLI/daemon that drives Chrome over CDP with accessibility-tree
@@ -23,6 +23,9 @@ config_section: agent_browser
 config:
   binary: agent-browser     # the agent-browser CLI on PATH (override for a pinned path)
   timeout_s: 60             # per-command subprocess timeout
+  max_response_bytes: 200000  # aggregate stdout+stderr byte cap per command; untrusted page
+                            # output over this is dropped and the tool returns a bounded error
+                            # (memory + model-context safety). Read/enforced by the plugin wrapper.
   home_url: ""              # homepage the panel opens to. When set, the panel auto-opens it if
                             # no browser page is open; the empty state also shows a Start button.
                             # Blank → the Start button opens about:blank (no auto-open).
@@ -59,6 +62,7 @@ settings:
   - { key: stream_quality, label: "Panel stream quality", type: number, description: "Interactive panel JPEG quality (1–100). Higher = crisper, more bandwidth. The panel also renders at your dock's size × device-pixel-ratio." }
   - { key: max_output, label: "Max page-text output (chars)", type: number, description: "Cap characters of page text returned to the model (LLM-safety). 0 = the CLI default." }
   - { key: timeout_s, label: "Command timeout (s)", type: number, description: "Per-command subprocess timeout for the browser tools." }
+  - { key: max_response_bytes, label: "Max response bytes", type: number, description: "Aggregate stdout+stderr byte cap per browser command. Output beyond this is dropped and the tool returns a bounded error — protects process memory and the model's context from unbounded page content. Default 200000." }
   - { key: binary, label: "agent-browser binary", type: string, description: "The agent-browser CLI on PATH (override with a pinned absolute path if needed)." }
 
 # Console view (ADR 0026) — an interactive, drivable browser viewport (CDP screencast + input).
