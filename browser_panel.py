@@ -37,15 +37,26 @@ log = logging.getLogger("protoagent.plugins.agent_browser")
 # ── /panel/dash auth gate: a short-lived, HMAC-signed session cookie ──────────────
 # The full-mode dashboard proxy (``/panel/dash`` + its CDP screencast WS) loads in an
 # iframe, which cannot carry an ``Authorization: Bearer`` header — so on a token-gated
-# deployment it would be reachable *unauthenticated*. Gate it with a short-lived signed
-# cookie the panel mints (via the bearer-gated ``POST /dash-session``) before it points
-# the iframe/WS at the proxy. The signing key is per-boot + in-memory ONLY: a cookie can
-# never outlive a restart, and there is no key at rest to steal. Non-token-gated
+# deployment it would be reachable *unauthenticated*. Gate it in two steps: the panel
+# mints a signed token via the bearer-gated ``POST /dash-session``, then presents it
+# once as ``?dash=`` on the proxy URL, whose response sets the ``ab_session`` cookie.
+# The cookie MUST be set from the proxy's own URL — RFC 6265 path-matching means a
+# cookie Path-scoped to the page surface set from a ``/api/...`` response is dropped
+# by browsers. The signing key is per-boot + in-memory ONLY: a cookie can never
+# outlive a restart, and there is no key at rest to steal. Non-token-gated
 # deployments leave the gate open (backward compatible — nothing has to mint a cookie).
 _DASH_COOKIE = "ab_session"
 _DASH_COOKIE_PATH = "/plugins/agent_browser/"   # cookie scope: the plugin's page surface only
 _DASH_TTL = 300                                 # ~5 min — long enough to load, short enough to leak-proof
 _DASH_KEY = secrets.token_bytes(32)             # per-boot random HMAC key; in-memory, never persisted
+
+
+def _dash_cookie_path(request_path: str) -> str:
+    """Cookie Path for ``ab_session``, derived from the URL that sets it so it always
+    path-matches (RFC 6265) — ``/plugins/agent_browser/`` on the host,
+    ``/agents/<slug>/plugins/agent_browser/`` through the fleet proxy."""
+    i = request_path.find(_DASH_COOKIE_PATH)
+    return request_path[: i + len(_DASH_COOKIE_PATH)] if i >= 0 else _DASH_COOKIE_PATH
 
 
 def _dash_sig(expiry: str) -> str:
@@ -96,12 +107,29 @@ def build_panel_router(cfg: dict | None):
     @router.get("/panel/dash")
     async def _panel_dash(request: Request):
         """Full-mode dashboard proxy entry — loaded in an iframe, so it can't carry a
-        bearer. On a token-gated deployment it requires the signed ``ab_session`` cookie
-        the panel minted via ``POST /dash-session`` (401 on a missing / tampered / expired
-        one); a non-gated deployment serves openly (backward compatible)."""
-        if _dash_auth_required(cfg) and not verify_dash_token(request.cookies.get(_DASH_COOKIE, "")):
+        bearer. On a token-gated deployment it admits the signed ``ab_session`` cookie
+        or a fresh ``?dash=<token>`` minted by the bearer-gated ``POST /dash-session``
+        (401 on a missing / tampered / expired one); a ``?dash=`` entry answers with the
+        ``Set-Cookie`` — it must happen HERE, not on the ``/api`` POST, because browsers
+        drop a cookie whose Path doesn't path-match the URL that set it — so reloads and
+        the plugin's sub-requests ride the cookie without re-minting. A non-gated
+        deployment serves openly (backward compatible)."""
+        page = _INTERACTIVE_PAGE.replace("__HOME_URL__", home_literal)
+        if not _dash_auth_required(cfg) or verify_dash_token(request.cookies.get(_DASH_COOKIE, "")):
+            return HTMLResponse(page)
+        token = request.query_params.get("dash", "")
+        if not verify_dash_token(token):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return HTMLResponse(_INTERACTIVE_PAGE.replace("__HOME_URL__", home_literal))
+        # First entry via the minted token: exchange it for the path-scoped session
+        # cookie. Secure when the origin — or the TLS-terminating proxy's
+        # ``X-Forwarded-Proto`` — is HTTPS.
+        secure = (request.url.scheme == "https"
+                  or request.headers.get("x-forwarded-proto", "").lower() == "https")
+        resp = HTMLResponse(page)
+        resp.set_cookie(_DASH_COOKIE, token, max_age=_DASH_TTL,
+                        path=_dash_cookie_path(request.url.path),
+                        httponly=True, samesite="strict", secure=secure)
+        return resp
 
     return router
 
@@ -131,20 +159,17 @@ def build_panel_data_router(cfg: dict | None):
         except subprocess.TimeoutExpired:
             return 124, "timed out"
 
-    # ── /panel/dash gate: mint the signed session cookie (bearer-gated route) ─────────
+    # ── /panel/dash gate: mint the signed session token (bearer-gated route) ─────────
     @router.post("/dash-session")
-    async def _dash_session(request: Request):
-        """Mint the short-lived signed ``ab_session`` cookie that gates the ``/panel/dash``
-        proxy. HTTP + under ``/api`` ⇒ it rides the host operator-bearer gate, so only an
-        authenticated console can set the cookie. HttpOnly (no JS read) + SameSite=Strict
-        (no cross-site send) + path-scoped to the plugin; Secure when the origin — or the
-        TLS-terminating proxy's ``X-Forwarded-Proto`` — is HTTPS."""
-        secure = (request.url.scheme == "https"
-                  or request.headers.get("x-forwarded-proto", "").lower() == "https")
-        resp = JSONResponse({"ok": True})
-        resp.set_cookie(_DASH_COOKIE, mint_dash_token(), max_age=_DASH_TTL,
-                        path=_DASH_COOKIE_PATH, httponly=True, samesite="strict", secure=secure)
-        return resp
+    async def _dash_session():
+        """Mint the short-lived signed token that unlocks the ``/panel/dash`` proxy.
+        HTTP + under ``/api`` ⇒ it rides the host operator-bearer gate, so only an
+        authenticated console can mint one. The token rides the body, NOT a Set-Cookie:
+        a cookie Path-scoped to the page surface would not path-match this ``/api/...``
+        URL, and browsers drop such a cookie (RFC 6265). The panel presents it once as
+        ``?dash=`` on the proxy URL, whose response sets the real path-matched
+        ``ab_session`` cookie (HttpOnly + SameSite=Strict + Secure-on-HTTPS)."""
+        return JSONResponse({"ok": True, "dash": mint_dash_token()})
 
     # ── interactive stream: a single-use ticket (gated) + the WS bridge (self-gated) ──
     @router.post("/stream-ticket")
@@ -334,13 +359,20 @@ function wsUrl(ticket){
   u.searchParams.set("ticket", ticket);
   return u.toString();
 }
-// ── /panel/dash auth: mint the short-lived ab_session cookie (bearer-gated) BEFORE
-// pointing the iframe/WS at the full-mode proxy. On a token-gated deployment the proxy
-// 401s a cookieless request; apiFetch carries the operator bearer so the POST can set
-// the cookie. A non-gated deployment doesn't need it, and a failure must not block the
-// stream — so this is best-effort and awaited only to order it before the connect. ──
+// ── /panel/dash auth: set the short-lived ab_session cookie BEFORE pointing the
+// iframe/WS at the full-mode proxy. On a token-gated deployment the proxy 401s a
+// cookieless request; apiFetch (operator bearer) mints a signed token, then ONE
+// same-origin GET presents it as ?dash= — the proxy answers THAT request with the
+// path-scoped cookie (a Set-Cookie must path-match its own URL or browsers drop it,
+// so the /api POST can't set it). A non-gated deployment doesn't need it, and a
+// failure must not block the stream — best-effort, awaited only to order it before
+// the connect. ──
 async function ensureDashSession(){
-  try{ await kit.apiFetch("/api/plugins/agent_browser/dash-session",{method:"POST"}); }catch(_){}
+  try{
+    const r=await kit.apiFetch("/api/plugins/agent_browser/dash-session",{method:"POST"});
+    const t=(await r.json()).dash;
+    if(t) await fetch(BASE+"/plugins/agent_browser/panel/dash?dash="+encodeURIComponent(t));
+  }catch(_){}
 }
 async function connect(){
   clearTimeout(retry);

@@ -379,11 +379,26 @@ def test_dash_token_roundtrips_and_expires():
     assert bp.verify_dash_token("garbage-no-dot", now=1000) is False
 
 
-def test_dash_session_sets_scoped_signed_cookie():
+def test_dash_session_mints_signed_token_without_api_cookie():
     from fastapi.testclient import TestClient
 
     r = TestClient(_app({"require_auth": True})).post("/api/plugins/agent_browser/dash-session")
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert bp.verify_dash_token(body["dash"]) is True    # a real, verifiable signed token
+    # NO Set-Cookie on the /api response: a Path=/plugins/agent_browser/ cookie would
+    # not path-match this /api/... URL and browsers drop it (RFC 6265) — the ?dash=
+    # exchange on the proxy itself sets the cookie instead.
+    assert "set-cookie" not in r.headers
+
+
+def test_dash_query_token_exchanges_for_path_matched_cookie():
+    from fastapi.testclient import TestClient
+
+    c = TestClient(_app({"require_auth": True}))
+    r = c.get(f"/plugins/agent_browser/panel/dash?dash={bp.mint_dash_token()}")
+    assert r.status_code == 200 and 'id="cv"' in r.text  # a valid minted token admits entry
     sc = r.headers["set-cookie"]
     low = sc.lower()
     assert sc.startswith("ab_session=")
@@ -391,30 +406,55 @@ def test_dash_session_sets_scoped_signed_cookie():
     assert "samesite=strict" in low                   # no cross-site send
     assert "path=/plugins/agent_browser/" in low      # scoped to the plugin's page surface
     assert "max-age=300" in low                       # ~5-min TTL
-    # the cookie value is a real, verifiable signed token
+    # the Path path-matches the URL that set it (RFC 6265 — else browsers drop the cookie)
+    cookie_path = next(p.split("=", 1)[1] for p in sc.split(";")
+                       if p.strip().lower().startswith("path="))
+    assert "/plugins/agent_browser/panel/dash".startswith(cookie_path)
+    # the cookie value is a real, verifiable signed token…
     token = sc.split("ab_session=", 1)[1].split(";", 1)[0]
     assert bp.verify_dash_token(token) is True
+    # …and the retained cookie admits a plain reload with no query token
+    assert c.get("/plugins/agent_browser/panel/dash").status_code == 200
 
 
-def test_dash_session_cookie_is_secure_only_on_https():
+def test_dash_cookie_path_follows_proxy_prefix():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    # through the fleet proxy the page surface lives under /agents/<slug>/… — the cookie
+    # Path must follow the actual request URL or the browser would never send it back.
+    app = FastAPI()
+    app.include_router(bp.build_panel_router({"require_auth": True}),
+                       prefix="/agents/slug/plugins/agent_browser")
+    r = TestClient(app).get(
+        f"/agents/slug/plugins/agent_browser/panel/dash?dash={bp.mint_dash_token()}")
+    assert "path=/agents/slug/plugins/agent_browser/" in r.headers["set-cookie"].lower()
+
+
+def test_dash_cookie_is_secure_only_on_https():
     from fastapi.testclient import TestClient
 
     app = _app({"require_auth": True})
-    http = TestClient(app).post("/api/plugins/agent_browser/dash-session")
+    url = "/plugins/agent_browser/panel/dash"
+    http = TestClient(app).get(f"{url}?dash={bp.mint_dash_token()}")
     assert "secure" not in http.headers["set-cookie"].lower()          # plain HTTP → no Secure flag
-    https = TestClient(app, base_url="https://testserver").post("/api/plugins/agent_browser/dash-session")
+    https = TestClient(app, base_url="https://testserver").get(f"{url}?dash={bp.mint_dash_token()}")
     assert "secure" in https.headers["set-cookie"].lower()             # HTTPS origin → Secure
-    xfp = TestClient(app).post("/api/plugins/agent_browser/dash-session",
-                               headers={"X-Forwarded-Proto": "https"})
+    xfp = TestClient(app).get(f"{url}?dash={bp.mint_dash_token()}",
+                              headers={"X-Forwarded-Proto": "https"})
     assert "secure" in xfp.headers["set-cookie"].lower()               # TLS-terminating proxy → Secure
 
 
 def test_dash_proxy_rejects_without_cookie_when_gated():
     from fastapi.testclient import TestClient
 
-    # token-gated deployment: the iframe proxy is unreachable without a valid cookie.
-    r = TestClient(_app({"require_auth": True})).get("/plugins/agent_browser/panel/dash")
-    assert r.status_code == 401
+    # token-gated deployment: the iframe proxy is unreachable without a valid cookie
+    # or a valid minted ?dash= token.
+    c = TestClient(_app({"require_auth": True}))
+    assert c.get("/plugins/agent_browser/panel/dash").status_code == 401
+    assert c.get("/plugins/agent_browser/panel/dash?dash=9999999999.forged").status_code == 401
+    expired = bp.mint_dash_token(now=0)
+    assert c.get(f"/plugins/agent_browser/panel/dash?dash={expired}").status_code == 401
 
 
 def test_dash_proxy_serves_with_valid_cookie_when_gated():
@@ -450,8 +490,10 @@ def test_panel_page_mints_dash_session_before_stream():
     from fastapi.testclient import TestClient
 
     html = TestClient(_app({})).get("/plugins/agent_browser/panel").text
-    # the panel POSTs the (bearer-gated) dash-session route to set the ab_session cookie…
+    # the panel mints a token via the (bearer-gated) dash-session route, then presents
+    # it as ?dash= to the proxy — whose response sets the path-matched ab_session cookie…
     assert "/api/plugins/agent_browser/dash-session" in html and "ensureDashSession" in html
+    assert "/plugins/agent_browser/panel/dash?dash=" in html
     # …and it does so from connect(), before the stream WS handshake.
     assert "await ensureDashSession();" in html
     assert html.index("await ensureDashSession();") < html.index("new WebSocket(")
