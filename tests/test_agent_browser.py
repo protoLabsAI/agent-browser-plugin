@@ -361,3 +361,99 @@ def test_nav_open_applies_launch_flags(monkeypatch):
     assert rec[-1] == ["agent-browser", "reload"]
 
 
+# ── /panel/dash signed-cookie auth gate (mint token + proxy gate) ─────────────────
+
+
+def test_dash_token_roundtrips_and_expires():
+    # a fresh token verifies through its ~5-min window; one minted in the past is expired;
+    # a flipped signature byte or a re-dated expiry can never forge the HMAC.
+    tok = bp.mint_dash_token(now=1000, ttl=300)
+    assert bp.verify_dash_token(tok, now=1000) is True
+    assert bp.verify_dash_token(tok, now=1299) is True
+    assert bp.verify_dash_token(tok, now=1301) is False           # past expiry → rejected
+    exp, _, sig = tok.partition(".")
+    bad_sig = sig[:-1] + ("1" if sig.endswith("0") else "0")
+    assert bp.verify_dash_token(f"{exp}.{bad_sig}", now=1000) is False   # tampered signature
+    assert bp.verify_dash_token(f"99999999999.{sig}", now=1000) is False  # re-dated expiry
+    assert bp.verify_dash_token("", now=1000) is False
+    assert bp.verify_dash_token("garbage-no-dot", now=1000) is False
+
+
+def test_dash_session_sets_scoped_signed_cookie():
+    from fastapi.testclient import TestClient
+
+    r = TestClient(_app({"require_auth": True})).post("/api/plugins/agent_browser/dash-session")
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    sc = r.headers["set-cookie"]
+    low = sc.lower()
+    assert sc.startswith("ab_session=")
+    assert "httponly" in low                          # not readable from JS
+    assert "samesite=strict" in low                   # no cross-site send
+    assert "path=/plugins/agent_browser/" in low      # scoped to the plugin's page surface
+    assert "max-age=300" in low                       # ~5-min TTL
+    # the cookie value is a real, verifiable signed token
+    token = sc.split("ab_session=", 1)[1].split(";", 1)[0]
+    assert bp.verify_dash_token(token) is True
+
+
+def test_dash_session_cookie_is_secure_only_on_https():
+    from fastapi.testclient import TestClient
+
+    app = _app({"require_auth": True})
+    http = TestClient(app).post("/api/plugins/agent_browser/dash-session")
+    assert "secure" not in http.headers["set-cookie"].lower()          # plain HTTP → no Secure flag
+    https = TestClient(app, base_url="https://testserver").post("/api/plugins/agent_browser/dash-session")
+    assert "secure" in https.headers["set-cookie"].lower()             # HTTPS origin → Secure
+    xfp = TestClient(app).post("/api/plugins/agent_browser/dash-session",
+                               headers={"X-Forwarded-Proto": "https"})
+    assert "secure" in xfp.headers["set-cookie"].lower()               # TLS-terminating proxy → Secure
+
+
+def test_dash_proxy_rejects_without_cookie_when_gated():
+    from fastapi.testclient import TestClient
+
+    # token-gated deployment: the iframe proxy is unreachable without a valid cookie.
+    r = TestClient(_app({"require_auth": True})).get("/plugins/agent_browser/panel/dash")
+    assert r.status_code == 401
+
+
+def test_dash_proxy_serves_with_valid_cookie_when_gated():
+    from fastapi.testclient import TestClient
+
+    c = TestClient(_app({"require_auth": True}))
+    token = bp.mint_dash_token()
+    r = c.get("/plugins/agent_browser/panel/dash", headers={"Cookie": f"ab_session={token}"})
+    assert r.status_code == 200 and 'id="cv"' in r.text                # the drivable dashboard served
+
+
+def test_dash_proxy_rejects_expired_or_tampered_cookie_when_gated():
+    from fastapi.testclient import TestClient
+
+    c = TestClient(_app({"require_auth": True}))
+    expired = bp.mint_dash_token(now=0)                                # exp far in the past
+    assert c.get("/plugins/agent_browser/panel/dash",
+                 headers={"Cookie": f"ab_session={expired}"}).status_code == 401
+    assert c.get("/plugins/agent_browser/panel/dash",
+                 headers={"Cookie": "ab_session=9999999999.deadbeef"}).status_code == 401   # bad signature
+
+
+def test_dash_proxy_open_when_not_gated():
+    from fastapi.testclient import TestClient
+
+    # backward compatible: a deployment that doesn't require bearer auth serves the proxy
+    # even with no cookie at all.
+    r = TestClient(_app({})).get("/plugins/agent_browser/panel/dash")
+    assert r.status_code == 200 and 'id="cv"' in r.text
+
+
+def test_panel_page_mints_dash_session_before_stream():
+    from fastapi.testclient import TestClient
+
+    html = TestClient(_app({})).get("/plugins/agent_browser/panel").text
+    # the panel POSTs the (bearer-gated) dash-session route to set the ab_session cookie…
+    assert "/api/plugins/agent_browser/dash-session" in html and "ensureDashSession" in html
+    # …and it does so from connect(), before the stream WS handshake.
+    assert "await ensureDashSession();" in html
+    assert html.index("await ensureDashSession();") < html.index("new WebSocket(")
+
+

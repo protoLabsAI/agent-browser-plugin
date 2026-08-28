@@ -15,19 +15,68 @@ when proxied) so the page is same-origin + slug-aware (the token/theme handshake
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import subprocess
+import time
 
 # Module-scope fastapi imports (the host always provides fastapi; __init__.py catches
 # ImportError so the tools still serve if the panel can't import).
-from fastapi import APIRouter, Body, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import browser_stream
 from .runtime import launch_flags
 
 log = logging.getLogger("protoagent.plugins.agent_browser")
+
+
+# ── /panel/dash auth gate: a short-lived, HMAC-signed session cookie ──────────────
+# The full-mode dashboard proxy (``/panel/dash`` + its CDP screencast WS) loads in an
+# iframe, which cannot carry an ``Authorization: Bearer`` header — so on a token-gated
+# deployment it would be reachable *unauthenticated*. Gate it with a short-lived signed
+# cookie the panel mints (via the bearer-gated ``POST /dash-session``) before it points
+# the iframe/WS at the proxy. The signing key is per-boot + in-memory ONLY: a cookie can
+# never outlive a restart, and there is no key at rest to steal. Non-token-gated
+# deployments leave the gate open (backward compatible — nothing has to mint a cookie).
+_DASH_COOKIE = "ab_session"
+_DASH_COOKIE_PATH = "/plugins/agent_browser/"   # cookie scope: the plugin's page surface only
+_DASH_TTL = 300                                 # ~5 min — long enough to load, short enough to leak-proof
+_DASH_KEY = secrets.token_bytes(32)             # per-boot random HMAC key; in-memory, never persisted
+
+
+def _dash_sig(expiry: str) -> str:
+    return hmac.new(_DASH_KEY, expiry.encode(), hashlib.sha256).hexdigest()
+
+
+def mint_dash_token(now: float | None = None, ttl: int = _DASH_TTL) -> str:
+    """Mint an HMAC-signed ``<expiry>.<sig>`` token good for ~5 min. Called only from the
+    bearer-gated ``POST /dash-session``, so possession proves the caller cleared the gate."""
+    exp = int((time.time() if now is None else now) + ttl)
+    return f"{exp}.{_dash_sig(str(exp))}"
+
+
+def verify_dash_token(token: str, now: float | None = None) -> bool:
+    """True iff ``token`` carries a valid signature (constant-time compare) and hasn't
+    expired. A missing/tampered signature or a re-dated expiry can't forge the HMAC."""
+    exp_s, _, sig = (token or "").partition(".")
+    if not sig or not hmac.compare_digest(sig, _dash_sig(exp_s)):
+        return False
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    return exp >= int(time.time() if now is None else now)
+
+
+def _dash_auth_required(cfg: dict | None) -> bool:
+    """The gate bites only on a token-gated deployment — the host signals that by setting
+    ``require_auth`` truthy in the plugin config (the same host that applies the operator
+    bearer gate). Absent/false ⇒ the proxy stays open (backward compatible)."""
+    return bool((cfg or {}).get("require_auth"))
 
 
 def build_panel_router(cfg: dict | None):
@@ -42,6 +91,16 @@ def build_panel_router(cfg: dict | None):
 
     @router.get("/panel")
     async def _panel():
+        return HTMLResponse(_INTERACTIVE_PAGE.replace("__HOME_URL__", home_literal))
+
+    @router.get("/panel/dash")
+    async def _panel_dash(request: Request):
+        """Full-mode dashboard proxy entry — loaded in an iframe, so it can't carry a
+        bearer. On a token-gated deployment it requires the signed ``ab_session`` cookie
+        the panel minted via ``POST /dash-session`` (401 on a missing / tampered / expired
+        one); a non-gated deployment serves openly (backward compatible)."""
+        if _dash_auth_required(cfg) and not verify_dash_token(request.cookies.get(_DASH_COOKIE, "")):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         return HTMLResponse(_INTERACTIVE_PAGE.replace("__HOME_URL__", home_literal))
 
     return router
@@ -71,6 +130,21 @@ def build_panel_data_router(cfg: dict | None):
             return 127, f"{binary!r} not on PATH"
         except subprocess.TimeoutExpired:
             return 124, "timed out"
+
+    # ── /panel/dash gate: mint the signed session cookie (bearer-gated route) ─────────
+    @router.post("/dash-session")
+    async def _dash_session(request: Request):
+        """Mint the short-lived signed ``ab_session`` cookie that gates the ``/panel/dash``
+        proxy. HTTP + under ``/api`` ⇒ it rides the host operator-bearer gate, so only an
+        authenticated console can set the cookie. HttpOnly (no JS read) + SameSite=Strict
+        (no cross-site send) + path-scoped to the plugin; Secure when the origin — or the
+        TLS-terminating proxy's ``X-Forwarded-Proto`` — is HTTPS."""
+        secure = (request.url.scheme == "https"
+                  or request.headers.get("x-forwarded-proto", "").lower() == "https")
+        resp = JSONResponse({"ok": True})
+        resp.set_cookie(_DASH_COOKIE, mint_dash_token(), max_age=_DASH_TTL,
+                        path=_DASH_COOKIE_PATH, httponly=True, samesite="strict", secure=secure)
+        return resp
 
     # ── interactive stream: a single-use ticket (gated) + the WS bridge (self-gated) ──
     @router.post("/stream-ticket")
@@ -260,8 +334,17 @@ function wsUrl(ticket){
   u.searchParams.set("ticket", ticket);
   return u.toString();
 }
+// ── /panel/dash auth: mint the short-lived ab_session cookie (bearer-gated) BEFORE
+// pointing the iframe/WS at the full-mode proxy. On a token-gated deployment the proxy
+// 401s a cookieless request; apiFetch carries the operator bearer so the POST can set
+// the cookie. A non-gated deployment doesn't need it, and a failure must not block the
+// stream — so this is best-effort and awaited only to order it before the connect. ──
+async function ensureDashSession(){
+  try{ await kit.apiFetch("/api/plugins/agent_browser/dash-session",{method:"POST"}); }catch(_){}
+}
 async function connect(){
   clearTimeout(retry);
+  await ensureDashSession();   // set the ab_session cookie before opening the (proxied) stream
   try{
     const r=await kit.apiFetch("/api/plugins/agent_browser/stream-ticket",{method:"POST"});
     const ticket=(await r.json()).ticket;
